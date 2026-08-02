@@ -28,6 +28,8 @@ The HTTP layer is responsible for:
 - mapping application results and errors to HTTP responses;
 - avoiding business rules and platform-specific branching.
 
+A malformed path identifier is a transport concern: it is rejected as a validation error before any port is called, so a syntactically impossible identifier never reaches PostgreSQL. A well-formed identifier that simply does not exist is a core failure and is reported as not found. An unexpected exception from any dependency becomes one uniform internal error with a fresh request identifier and no detail of what failed.
+
 ## Application layer
 
 Application use cases coordinate the required behavior:
@@ -45,7 +47,7 @@ The domain defines normalized comment data, typed identifiers, results, errors, 
 Expected ports include:
 
 - comment persistence;
-- transaction management;
+- published-post and reply-context resolution;
 - social-platform comment operations.
 
 The domain must not depend on HTTP types, PostgreSQL clients, provider SDKs, or framework-specific abstractions.
@@ -71,6 +73,26 @@ The comment hierarchy uses an adjacency-list relationship through a parent comme
 
 Repeated synchronization of the same external comment must not create duplicates.
 
+### Migration history
+
+Migrations are plain numbered SQL files applied in filename order, each in its own transaction and
+each recorded with the SHA-256 checksum of the file that was applied. The recorded history is
+treated as evidence about a deployed schema, so the runner refuses to continue when that evidence
+stops matching the files: an edited migration, a migration that has disappeared from the directory,
+and a history that predates checksums but already records applied migrations are all reported and
+nothing further is applied. A checksum is never invented, rewritten, or deleted to make a run pass.
+
+### Optimistic locking
+
+Every comment row carries a `version`. It supports the standard compare-and-set pattern: an update
+that matches the expected version advances it, and an update carrying a stale expected version
+changes nothing. An integration test proves that behavior against the real `comments` table, and
+re-importing a known comment increments the version of the projection.
+
+No use case performs optimistic locking today. Editing and deletion are out of scope, so nothing
+supplies an expected version, and no versioned mutation port exists. The column and its verified
+behavior are the persistence-side boundary that such a command would build on.
+
 ## Reply publication
 
 Reply publication is synchronous:
@@ -80,9 +102,9 @@ Reply publication is synchronous:
 3. an existing comment is looked up by idempotency key;
 4. a match on parent and exact content replays the stored reply; any other match is a conflict;
 5. the platform adapter is resolved and called outside every database transaction;
-6. the confirmed reply is persisted by one atomic statement;
-7. the persisted row is compared with the request once more, because a concurrent request carrying
-   the same key may have stored first;
+6. the confirmed reply is persisted by one short transaction that opens only afterwards;
+7. the persisted row is compared with the request once more, because a concurrent request may have
+   stored first;
 8. the reply is returned as created or as already existing.
 
 The same idempotency key with the same parent and the exact same content returns the existing
@@ -92,8 +114,23 @@ parent or different content produces a conflict.
 ### Idempotency and concurrency
 
 One local row exists per idempotency key: a partial unique index enforces it, and the publication
-statement converges concurrent writers onto a single row rather than failing. A reply already
-imported by retrieval is reconciled instead of duplicated, and a recorded key is never replaced.
+transaction converges concurrent writers onto a single row rather than failing. Requests sharing a
+key are serialized by a transaction-scoped advisory lock derived from that key, so the key is
+claimed exactly once even if the platform answers two of them with different external comment
+identifiers.
+
+The mirrored case is one external comment reached by two different keys, which happens when the
+platform deduplicates on its own side. PostgreSQL identifies one row there, so exactly one key can
+own it:
+
+- a row imported by retrieval carries no key yet and adopts the requesting one, keeping its
+  internal identifier and its local creation timestamp;
+- a row already carrying the requesting key is returned as the existing result;
+- a row already carrying a different key keeps it. The request is not credited with a row it never
+  owned: it is reported as an idempotency conflict rather than as a successful replay, no duplicate
+  is written, and no database constraint error reaches the caller.
+
+Neither the stored nor the requested key is ever exposed in a response.
 
 The guarantee is deliberately local. Without provider idempotency, reservation states,
 reconciliation, or an outbox, an external call may complete while its outcome stays unknown. That
@@ -102,8 +139,8 @@ automatically. This is the intended current behavior, not an omission.
 
 ### Why no transaction manager
 
-Every implemented write is a single statement that PostgreSQL already executes atomically, so no
-use case needs to compose two writes. The external call happens before persistence and never runs
+Every implemented write is owned by one adapter and is atomic as seen by the application, so no use
+case needs to compose two writes. The external call happens before persistence and never runs
 inside a transaction, which is precisely what a transaction manager must not be allowed to make
 easy. An abstraction is added when behavior requires it.
 

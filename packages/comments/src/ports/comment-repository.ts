@@ -23,9 +23,11 @@ export interface CommentRepository {
     findByIdempotencyKey(idempotencyKey: IdempotencyKey): Promise<Comment | null>;
 
     /**
-     * Persists a confirmed platform reply in one atomic statement. Two requests carrying the same
-     * idempotency key converge on a single row, and an already imported projection of the same
-     * platform comment is reconciled rather than duplicated.
+     * Persists a confirmed platform reply after the platform has already answered, never around an
+     * external call. Two requests carrying the same idempotency key converge on a single row, and
+     * an already imported projection of the same platform comment is reconciled rather than
+     * duplicated. A key already recorded on that row is never replaced, so a request whose key did
+     * not reach the row is answered with the stored row and its own key, not with a rewritten one.
      */
     savePublishedReply(reply: PublishedReply): Promise<SavePublishedReplyResult>;
 }

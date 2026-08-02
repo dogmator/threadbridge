@@ -280,7 +280,11 @@ Platform gateways report expected failures as typed results rather than exceptio
 
 A publication operation reports whether it created a row or converged on one an earlier request had already stored, so the transport can answer `201 Created` or `200 OK` without inspecting persistence details.
 
-The implemented writes are single atomic statements owned by their adapter: importing a page upserts on external identity, and publishing a reply upserts once after the platform has already answered. No application-visible transaction manager exists, because no use case composes two writes that must succeed or fail together. One is introduced only when behavior requires it.
+Every implemented write is owned by its adapter and is atomic as seen by the application: importing a page upserts on external identity, and publishing a reply runs one short transaction that opens only after the platform has already answered. No application-visible transaction manager exists, because no use case composes two writes that must succeed or fail together. One is introduced only when behavior requires it.
+
+The `version` column supports optimistic compare-and-set persistence: an update that matches the expected version advances it, while an update carrying a stale expected version changes nothing. That schema behavior is verified by an integration test against the real `comments` table. Re-importing a comment that is already known locally increments the version of the projection.
+
+Comment editing and deletion are out of scope, so no current command lets a caller supply an expected version, and no versioned mutation port exists. Such a port is defined by the command that needs it rather than added in advance.
 
 A platform registry may be represented by a typed read-only map. A dedicated registry class is unnecessary until registry-specific behavior appears.
 
@@ -418,6 +422,8 @@ Required scenarios:
 - replying to a comment at arbitrary depth;
 - health endpoint success;
 - unknown route response.
+
+The optimistic-locking scenario is owned by a PostgreSQL integration test that exercises the compare-and-set pattern directly, because no current use case accepts an expected version. Malformed identifiers and unexpected internal failures are transport concerns and are owned by the HTTP tests.
 
 Tests must not weaken TypeScript or ESLint configuration, add production behavior, or reshape the architecture solely to make tests easier.
 

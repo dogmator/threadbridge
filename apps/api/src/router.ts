@@ -152,13 +152,12 @@ const respondWithPostComments = async (
     rawPostId: string,
     url: URL,
 ): Promise<void> => {
-    const postId = toPostId(rawPostId);
-
     if (!UUID_PATTERN.test(rawPostId)) {
-        writeFailure(response, {code: 'POST_NOT_FOUND', postId}, dependencies);
+        writeValidationError(response, dependencies);
         return;
     }
 
+    const postId = toPostId(rawPostId);
     const cursor = readCursor(url);
     const query: GetPostCommentsQuery = cursor === undefined ? {postId} : {postId, cursor};
     const result = await dependencies.getPostComments.execute(query);
@@ -177,13 +176,12 @@ const respondWithCommentReplies = async (
     rawCommentId: string,
     url: URL,
 ): Promise<void> => {
-    const commentId = toCommentId(rawCommentId);
-
     if (!UUID_PATTERN.test(rawCommentId)) {
-        writeFailure(response, {code: 'COMMENT_NOT_FOUND', commentId}, dependencies);
+        writeValidationError(response, dependencies);
         return;
     }
 
+    const commentId = toCommentId(rawCommentId);
     const cursor = readCursor(url);
     const query: GetCommentRepliesQuery = cursor === undefined ? {commentId} : {commentId, cursor};
     const result = await dependencies.getCommentReplies.execute(query);

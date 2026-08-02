@@ -421,6 +421,74 @@ describe('ReplyToComment', () => {
         });
     });
 
+    it('reports a conflict when the stored row is owned by another idempotency key', async () => {
+        const result = await new ReplyToComment(
+            new StubReplyContextRepository(replyContext),
+            new Map<SocialPlatform, SocialCommentsGateway>([
+                [demoPlatform, new StubGateway(ok<PlatformComment>(publishedPlatformComment))],
+            ]),
+            new StubCommentRepository(null, {
+                kind: 'existing',
+                comment: storedComment(
+                    'Thank you for your comment',
+                    parentCommentId,
+                    toIdempotencyKey('key-2'),
+                ),
+            }),
+        ).execute(query);
+
+        expect(result).toEqual({
+            ok: false,
+            error: {code: 'IDEMPOTENCY_CONFLICT', idempotencyKey},
+        });
+    });
+
+    it('reports a conflict when the stored row carries no idempotency key at all', async () => {
+        const importedRow: Comment = {
+            id: toCommentId('0198f000-0000-7000-8000-0000000000c2'),
+            postId,
+            parentCommentId,
+            externalCommentId: toExternalCommentId('demo-imported-earlier'),
+            externalAuthorId: toExternalAuthorId('demo-author-self'),
+            content: 'Thank you for your comment',
+            platformCreatedAt: new Date('2026-01-03T00:00:00.000Z'),
+            metadata: null,
+            createdAt: storedAt,
+            updatedAt: storedAt,
+            version: 1,
+        };
+
+        const result = await new ReplyToComment(
+            new StubReplyContextRepository(replyContext),
+            new Map<SocialPlatform, SocialCommentsGateway>([
+                [demoPlatform, new StubGateway(ok<PlatformComment>(publishedPlatformComment))],
+            ]),
+            new StubCommentRepository(null, {kind: 'existing', comment: importedRow}),
+        ).execute(query);
+
+        expect(result).toEqual({
+            ok: false,
+            error: {code: 'IDEMPOTENCY_CONFLICT', idempotencyKey},
+        });
+    });
+
+    it('accepts a row that adopted the requested key while it was imported earlier', async () => {
+        const adopted: Comment = {
+            ...storedComment('Thank you for your comment'),
+            externalCommentId: toExternalCommentId('demo-imported-earlier'),
+        };
+
+        const result = await new ReplyToComment(
+            new StubReplyContextRepository(replyContext),
+            new Map<SocialPlatform, SocialCommentsGateway>([
+                [demoPlatform, new StubGateway(ok<PlatformComment>(publishedPlatformComment))],
+            ]),
+            new StubCommentRepository(null, {kind: 'existing', comment: adopted}),
+        ).execute(query);
+
+        expect(result).toEqual({ok: true, value: {kind: 'existing', comment: adopted}});
+    });
+
     it('does not let the caller supply infrastructure fields', async () => {
         const gateway = new StubGateway(ok<PlatformComment>(publishedPlatformComment));
         const useCase = new ReplyToComment(

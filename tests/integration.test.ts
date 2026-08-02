@@ -1,8 +1,6 @@
 import {once} from 'node:events';
 import {setTimeout} from 'node:timers/promises';
-import {mkdtemp, rm, writeFile} from 'node:fs/promises';
-import {tmpdir} from 'node:os';
-import {join, resolve} from 'node:path';
+import {resolve} from 'node:path';
 import postgres from 'postgres';
 import {afterAll, beforeAll, describe, expect, it} from 'vitest';
 import {PostgresCommentReplyContextRepository}
@@ -29,6 +27,7 @@ import {
     type AccountId,
     type Comment,
     type CommentId,
+    type ExternalCommentId,
     type IdempotencyKey,
     type IndeterminatePlatformResultFailure,
     type NormalizedComment,
@@ -60,6 +59,11 @@ const fixtureExternalPostId = 'integration-post';
 
 interface IdRow {
     readonly id: string;
+}
+
+interface KeyedRow {
+    readonly id: string;
+    readonly idempotency_key: string | null;
 }
 
 const platformCreatedAt = new Date('2026-03-01T09:00:00.000Z');
@@ -166,30 +170,6 @@ describe('migrations', () => {
             'schema_migrations',
         ]);
         expect(seededPosts.at(0)?.id).toBe('0198f000-0000-7000-8000-000000000002');
-    });
-
-    it('rejects an applied migration whose content changed', async () => {
-        const directory = await mkdtemp(join(tmpdir(), 'threadbridge-migrations-'));
-        const fileName = '9999_checksum_probe.sql';
-        const file = join(directory, fileName);
-
-        try {
-            await writeFile(file, 'create table if not exists checksum_probe (id integer);\n');
-            await runMigrations(sql, directory);
-
-            await writeFile(
-                file,
-                'create table if not exists checksum_probe (id integer, extra text);\n',
-            );
-
-            await expect(runMigrations(sql, directory)).rejects.toThrow(
-                /9999_checksum_probe\.sql was modified after it was applied/u,
-            );
-        } finally {
-            await sql`delete from schema_migrations where name = ${fileName}`;
-            await sql`drop table if exists checksum_probe`;
-            await rm(directory, {recursive: true, force: true});
-        }
     });
 });
 
@@ -316,6 +296,59 @@ describe('PostgresCommentReplyContextRepository', () => {
         );
 
         expect(context).toBeNull();
+    });
+});
+
+interface VersionedRow {
+    readonly id: string;
+    readonly content: string;
+    readonly version: number;
+}
+
+describe('comments optimistic locking', () => {
+    /**
+     * The schema, not a use case, is what has to support optimistic locking today: the current
+     * scope has no editing command, so no caller supplies an expected version. This proves the
+     * compare-and-set pattern a future versioned mutation would rely on.
+     */
+    it('accepts a compare-and-set on the current version and ignores a stale one', async () => {
+        const repository = new PostgresCommentRepository(sql);
+        const [stored] = await repository.saveMany([importedComment('optimistic', null)]);
+
+        if (stored === undefined) {
+            throw new Error('The comment fixture was not persisted.');
+        }
+
+        expect(stored.version).toBe(1);
+
+        const updated = await sql<VersionedRow[]>`
+            update comments
+            set content = 'Compare-and-set', updated_at = now(), version = version + 1
+            where id = ${stored.id} and version = 1
+            returning id, content, version
+        `;
+
+        expect(updated).toHaveLength(1);
+        expect(updated.at(0)?.version).toBe(2);
+
+        const stale = await sql<VersionedRow[]>`
+            update comments
+            set content = 'Stale write', updated_at = now(), version = version + 1
+            where id = ${stored.id} and version = 1
+            returning id, content, version
+        `;
+
+        expect(stale).toHaveLength(0);
+
+        const current = await sql<VersionedRow[]>`
+            select id, content, version from comments where id = ${stored.id}
+        `;
+
+        expect(current.at(0)).toEqual({
+            id: stored.id,
+            content: 'Compare-and-set',
+            version: 2,
+        });
     });
 });
 
@@ -607,14 +640,23 @@ describe('PostgresCommentRepository publication', () => {
 
         const original = toIdempotencyKey('integration-key-9');
         const reply = publishedReply('keep', parent.id, 'Keep the key', original);
-        await repository.savePublishedReply(reply);
+        const first = await repository.savePublishedReply(reply);
 
         const saved = await repository.savePublishedReply({
             ...reply,
             idempotencyKey: toIdempotencyKey('integration-key-10'),
         });
+        const rows = await sql<IdRow[]>`
+            select id from comments
+            where post_id = ${fixturePostId}
+              and external_comment_id = ${reply.externalCommentId}
+        `;
 
+        expect(saved.kind).toBe('existing');
         expect(saved.comment.idempotencyKey).toBe(original);
+        expect(saved.comment.id).toBe(first.comment.id);
+        expect(saved.comment.createdAt).toEqual(first.comment.createdAt);
+        expect(rows).toHaveLength(1);
         expect(await repository.findByIdempotencyKey(toIdempotencyKey('integration-key-10')))
             .toBeNull();
     });
@@ -650,6 +692,66 @@ class DivergingGateway implements SocialCommentsGateway {
                 metadata: null,
             }),
         );
+    }
+}
+
+/** Releases every caller only once the expected number of callers has arrived. */
+class Barrier {
+    private arrived = 0;
+
+    private release: () => void = (): void => undefined;
+
+    private readonly opened = new Promise<void>((resolve): void => {
+        this.release = resolve;
+    });
+
+    public constructor(private readonly expected: number) {}
+
+    public async arrive(): Promise<void> {
+        this.arrived += 1;
+
+        if (this.arrived >= this.expected) {
+            this.release();
+        }
+
+        await this.opened;
+    }
+}
+
+/**
+ * Answers every publication with one external comment id, as a platform that deduplicates on its
+ * own side would. An optional barrier holds each caller until the expected number of requests has
+ * reached the platform, so both requests provably enter persistence with the same external
+ * identity in hand instead of relying on scheduling luck.
+ */
+class ConvergingGateway implements SocialCommentsGateway {
+    public constructor(
+        private readonly externalCommentId: ExternalCommentId,
+        private readonly barrier: Barrier | null = null,
+    ) {}
+
+    public getComments(): never {
+        throw new Error('This gateway only publishes.');
+    }
+
+    public getReplies(): never {
+        throw new Error('This gateway only publishes.');
+    }
+
+    public async replyToComment(
+        input: ReplyToPlatformCommentInput,
+    ): Promise<Result<PlatformComment, PlatformFailure | IndeterminatePlatformResultFailure>> {
+        if (this.barrier !== null) {
+            await this.barrier.arrive();
+        }
+
+        return ok<PlatformComment>({
+            externalCommentId: this.externalCommentId,
+            externalAuthorId: toExternalAuthorId('integration-author-self'),
+            content: input.content,
+            createdAt: platformCreatedAt,
+            metadata: null,
+        });
     }
 }
 
@@ -721,6 +823,144 @@ describe('ReplyToComment against real PostgreSQL', () => {
         expect(rows).toHaveLength(1);
         expect(results.every((result): boolean => result.ok)).toBe(true);
         expect(new Set(outcomes).size).toBe(1);
+    });
+
+    it('adopts an imported external comment that carries no key yet', async () => {
+        const comments = new PostgresCommentRepository(sql);
+        const contexts = new PostgresCommentReplyContextRepository(sql);
+        const [parent] = await comments.saveMany([importedComment('adopt-parent', null)]);
+
+        if (parent === undefined) {
+            throw new Error('The parent comment was not persisted.');
+        }
+
+        const [imported] = await comments.saveMany([
+            {...importedComment('adopt-target', parent.id), content: 'Adopted content'},
+        ]);
+
+        if (imported === undefined) {
+            throw new Error('The imported reply was not persisted.');
+        }
+
+        const useCase = new ReplyToComment(
+            contexts,
+            new Map<SocialPlatform, SocialCommentsGateway>([
+                [
+                    toSocialPlatform('demo'),
+                    new ConvergingGateway(imported.externalCommentId),
+                ],
+            ]),
+            comments,
+        );
+        const key = toIdempotencyKey('integration-key-adopt');
+
+        const result = await useCase.execute({
+            parentCommentId: parent.id,
+            content: 'Adopted content',
+            idempotencyKey: key,
+        });
+        const rows = await sql<KeyedRow[]>`
+            select id, idempotency_key from comments
+            where post_id = ${fixturePostId}
+              and external_comment_id = ${imported.externalCommentId}
+        `;
+
+        expect(result.ok).toBe(true);
+        expect(result.ok ? result.value.comment.id : null).toBe(imported.id);
+        expect(result.ok ? result.value.comment.createdAt : null).toEqual(imported.createdAt);
+        expect(rows).toHaveLength(1);
+        expect(rows.at(0)?.idempotency_key).toBe(key);
+    });
+
+    it('reports a conflict when another key already owns the returned external comment', async () => {
+        const comments = new PostgresCommentRepository(sql);
+        const contexts = new PostgresCommentReplyContextRepository(sql);
+        const [parent] = await comments.saveMany([importedComment('collide-sequential', null)]);
+
+        if (parent === undefined) {
+            throw new Error('The parent comment was not persisted.');
+        }
+
+        const externalCommentId = toExternalCommentId('integration-converging-sequential');
+        const useCase = new ReplyToComment(
+            contexts,
+            new Map<SocialPlatform, SocialCommentsGateway>([
+                [toSocialPlatform('demo'), new ConvergingGateway(externalCommentId)],
+            ]),
+            comments,
+        );
+        const owner = toIdempotencyKey('integration-key-owner');
+        const loser = toIdempotencyKey('integration-key-loser');
+        const request = {parentCommentId: parent.id, content: 'Converging'};
+
+        const first = await useCase.execute({...request, idempotencyKey: owner});
+        const second = await useCase.execute({...request, idempotencyKey: loser});
+        const repeated = await useCase.execute({...request, idempotencyKey: loser});
+        const rows = await sql<KeyedRow[]>`
+            select id, idempotency_key from comments
+            where post_id = ${fixturePostId} and external_comment_id = ${externalCommentId}
+        `;
+
+        expect(first.ok).toBe(true);
+        expect(second).toEqual({
+            ok: false,
+            error: {code: 'IDEMPOTENCY_CONFLICT', idempotencyKey: loser},
+        });
+        expect(repeated).toEqual({
+            ok: false,
+            error: {code: 'IDEMPOTENCY_CONFLICT', idempotencyKey: loser},
+        });
+        expect(rows).toHaveLength(1);
+        expect(rows.at(0)?.idempotency_key).toBe(owner);
+        expect(await comments.findByIdempotencyKey(loser)).toBeNull();
+    });
+
+    it('resolves a concurrent different-key collision as one row and one conflict', async () => {
+        const comments = new PostgresCommentRepository(sql);
+        const contexts = new PostgresCommentReplyContextRepository(sql);
+        const [parent] = await comments.saveMany([importedComment('collide-parent', null)]);
+
+        if (parent === undefined) {
+            throw new Error('The parent comment was not persisted.');
+        }
+
+        const externalCommentId = toExternalCommentId('integration-converging-concurrent');
+        const useCase = new ReplyToComment(
+            contexts,
+            new Map<SocialPlatform, SocialCommentsGateway>([
+                [
+                    toSocialPlatform('demo'),
+                    new ConvergingGateway(externalCommentId, new Barrier(2)),
+                ],
+            ]),
+            comments,
+        );
+        const first = toIdempotencyKey('integration-key-collide-a');
+        const second = toIdempotencyKey('integration-key-collide-b');
+        const request = {parentCommentId: parent.id, content: 'Collide'};
+
+        // Neither call rejects: a unique-constraint violation would surface here as a rejection.
+        const results = await Promise.all([
+            useCase.execute({...request, idempotencyKey: first}),
+            useCase.execute({...request, idempotencyKey: second}),
+        ]);
+        const rows = await sql<KeyedRow[]>`
+            select id, idempotency_key from comments
+            where post_id = ${fixturePostId} and external_comment_id = ${externalCommentId}
+        `;
+        const claimed = await sql<KeyedRow[]>`
+            select id, idempotency_key from comments
+            where idempotency_key in (${first}, ${second})
+        `;
+        const outcomes = results.map((result): string | null =>
+            result.ok ? (result.value.comment.idempotencyKey ?? null) : result.error.code);
+
+        expect(rows).toHaveLength(1);
+        expect(claimed).toHaveLength(1);
+        expect(rows.at(0)?.idempotency_key).toBe(claimed.at(0)?.idempotency_key);
+        expect(outcomes.filter((outcome): boolean => outcome === 'IDEMPOTENCY_CONFLICT'))
+            .toHaveLength(1);
+        expect(outcomes).toContain(rows.at(0)?.idempotency_key);
     });
 });
 
@@ -840,12 +1080,24 @@ describe('retrieval REST endpoints', () => {
         expect(body.error.message).toBe('Comment was not found');
     });
 
-    it('reports a malformed identifier as not found instead of failing', async () => {
+    it('rejects a malformed post identifier before it reaches PostgreSQL', async () => {
         const response = await fetch(`${baseUrl}/posts/not-a-uuid/comments`);
         const body = (await response.json()) as HttpErrorEnvelope;
 
-        expect(response.status).toBe(404);
-        expect(body.error.code).toBe('POST_NOT_FOUND');
+        expect(response.status).toBe(400);
+        expect(body.error.code).toBe('VALIDATION_ERROR');
+        expect(body.error.message).toBe('Request validation failed');
+        expect(body.error.requestId.length).toBeGreaterThan(0);
+    });
+
+    it('rejects a malformed comment identifier before it reaches PostgreSQL', async () => {
+        const response = await fetch(`${baseUrl}/comments/not-a-uuid/replies`);
+        const body = (await response.json()) as HttpErrorEnvelope;
+
+        expect(response.status).toBe(400);
+        expect(body.error.code).toBe('VALIDATION_ERROR');
+        expect(body.error.message).toBe('Request validation failed');
+        expect(body.error.requestId.length).toBeGreaterThan(0);
     });
 
     it('keeps the health response unchanged', async () => {

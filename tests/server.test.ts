@@ -42,6 +42,28 @@ const dependenciesWith = (requestIdFactory: () => string): ApiServerDependencies
     replyToComment: new ReplyToComment(noReplyContexts, noGateways, noComments),
 });
 
+/**
+ * Stands in for an adapter failing in a way no client may ever see: the message carries a
+ * credential, a connection string, and an internal relation name.
+ */
+const leakyFailure = (): never => {
+    throw new Error(
+        'relation "comments" does not exist '
+        + '(postgresql://threadbridge:hunter2@db:5432/threadbridge)',
+    );
+};
+
+const failingPosts: PublishedPostRepository = {findContextByPostId: leakyFailure};
+
+const failingReplyContexts: CommentReplyContextRepository = {findByCommentId: leakyFailure};
+
+const failingDependenciesWith = (requestIdFactory: () => string): ApiServerDependencies => ({
+    requestIdFactory,
+    getPostComments: new GetPostComments(failingPosts, noGateways, noComments),
+    getCommentReplies: new GetCommentReplies(failingReplyContexts, noGateways, noComments),
+    replyToComment: new ReplyToComment(failingReplyContexts, noGateways, noComments),
+});
+
 class CountingRequestIdFactory {
     public calls = 0;
 
@@ -57,8 +79,9 @@ class CountingRequestIdFactory {
 const withApiServer = async (
     use: (baseUrl: string) => Promise<void>,
     requestIdFactory: () => string = randomUUID,
+    dependenciesFor: (factory: () => string) => ApiServerDependencies = dependenciesWith,
 ): Promise<void> => {
-    const server = createApiServer(dependenciesWith(requestIdFactory));
+    const server = createApiServer(dependenciesFor(requestIdFactory));
 
     server.listen(0, '127.0.0.1');
     await once(server, 'listening');
@@ -175,4 +198,84 @@ describe('API server', () => {
             expect(body.error.requestId.length).toBeGreaterThan(0);
         });
     });
+});
+
+interface FailingRoute {
+    readonly name: string;
+    readonly path: string;
+    readonly init: RequestInit;
+}
+
+const failingRoutes: readonly FailingRoute[] = [
+    {
+        name: 'root comment retrieval',
+        path: '/posts/0198f000-0000-7000-8000-0000000000aa/comments',
+        init: {},
+    },
+    {
+        name: 'direct reply retrieval',
+        path: '/comments/0198f000-0000-7000-8000-0000000000ab/replies',
+        init: {},
+    },
+    {
+        name: 'reply publication',
+        path: '/comments',
+        init: {
+            method: 'POST',
+            headers: {
+                'content-type': 'application/json',
+                'idempotency-key': 'server-secret-key',
+            },
+            body: JSON.stringify({
+                parentCommentId: '0198f000-0000-7000-8000-0000000000ac',
+                content: 'A reply',
+            }),
+        },
+    },
+];
+
+/** Anything that must never appear in a response, whatever the adapter reported internally. */
+const forbiddenFragments = [
+    'hunter2',
+    'postgresql://',
+    'relation',
+    'does not exist',
+    'server-secret-key',
+    '0198f000',
+    'at Object',
+];
+
+describe('unexpected failures', () => {
+    it.each(failingRoutes)(
+        'answers an unexpected failure of $name with the internal error envelope',
+        async (route: FailingRoute): Promise<void> => {
+            const requestIds = new CountingRequestIdFactory('request-1');
+
+            await withApiServer(
+                async (baseUrl): Promise<void> => {
+                    const response = await fetch(`${baseUrl}${route.path}`, route.init);
+                    const raw = await response.text();
+
+                    expect(response.status).toBe(500);
+                    expect(response.headers.get('content-type'))
+                        .toBe('application/json; charset=utf-8');
+                    expect(JSON.parse(raw) as unknown).toEqual({
+                        error: {
+                            code: 'INTERNAL_ERROR',
+                            message: 'Internal error',
+                            requestId: 'request-1',
+                        },
+                    });
+
+                    for (const fragment of forbiddenFragments) {
+                        expect(raw).not.toContain(fragment);
+                    }
+                },
+                requestIds.create,
+                failingDependenciesWith,
+            );
+
+            expect(requestIds.calls).toBe(1);
+        },
+    );
 });

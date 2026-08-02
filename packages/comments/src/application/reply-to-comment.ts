@@ -98,8 +98,10 @@ export class ReplyToComment {
         const stored = await this.comments.savePublishedReply(reply);
 
         // A concurrent request carrying the same key may have persisted first, after this request
-        // read the key and before it wrote. The stored row decides the outcome.
-        if (!this.matchesRequest(stored.comment, query)) {
+        // read the key and before it wrote. The platform may also have answered two requests with
+        // one external comment, in which case the row belongs to whichever key reached it first.
+        // The stored row decides the outcome.
+        if (!this.isReplayOf(stored.comment, query)) {
             return err<ReplyToCommentFailure>({
                 code: 'IDEMPOTENCY_CONFLICT',
                 idempotencyKey: query.idempotencyKey,
@@ -113,7 +115,7 @@ export class ReplyToComment {
         comment: Comment,
         query: ReplyToCommentQuery,
     ): Result<ReplyToCommentSuccess, ReplyToCommentFailure> {
-        if (!this.matchesRequest(comment, query)) {
+        if (!this.isReplayOf(comment, query)) {
             return err<ReplyToCommentFailure>({
                 code: 'IDEMPOTENCY_CONFLICT',
                 idempotencyKey: query.idempotencyKey,
@@ -123,8 +125,14 @@ export class ReplyToComment {
         return ok<ReplyToCommentSuccess>({kind: 'existing', comment});
     }
 
-    private matchesRequest(comment: Comment, query: ReplyToCommentQuery): boolean {
-        return comment.parentCommentId === query.parentCommentId
+    /**
+     * A stored row answers this request only when it carries this request's key. A row owning a
+     * different key is a distinct publication that merely converged on the same external comment,
+     * and reporting it as a successful replay would credit this request with a row it never owned.
+     */
+    private isReplayOf(comment: Comment, query: ReplyToCommentQuery): boolean {
+        return comment.idempotencyKey === query.idempotencyKey
+            && comment.parentCommentId === query.parentCommentId
             && comment.content === query.content;
     }
 }
