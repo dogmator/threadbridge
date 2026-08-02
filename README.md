@@ -54,6 +54,14 @@ Publishing is idempotent: repeating that exact request returns `200` with the sa
 reusing the key with different content returns `409`. An unknown external outcome is reported as
 `502 INDETERMINATE_PLATFORM_RESULT` and is never retried automatically.
 
+Retrieval reports what the platform currently returns, and the demo gateway keeps the replies it
+publishes in memory only. After restarting the API container, a reply published earlier is
+therefore no longer listed by the retrieval endpoints. Nothing is lost locally: the PostgreSQL
+projection still holds the row, replaying its idempotency key still returns `200` with the same
+identifier, and reusing that key with different content still returns `409`. A real platform
+adapter keeps its own history, so this is a property of the demonstrational gateway rather than of
+the service.
+
 ## Requirements
 
 The complete behavioral and architectural contract is documented in [SPECIFICATION.md](./SPECIFICATION.md).
@@ -94,6 +102,13 @@ Stop the services:
 
 ```bash
 docker compose down
+```
+
+Stop them and discard the database volume as well, which removes every published reply and returns
+the demo data to its seeded state on the next start:
+
+```bash
+docker compose down -v
 ```
 
 ## Quality checks

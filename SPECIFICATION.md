@@ -246,9 +246,6 @@ The minimum application-facing contracts are conceptually equivalent to:
 
 ```ts
 interface CommentRepository {
-    getRootComments(input: GetRootCommentsQuery): Promise<CommentPage>;
-    getReplies(input: GetRepliesQuery): Promise<CommentPage>;
-    findById(id: CommentId): Promise<Comment | null>;
     findByIdempotencyKey(key: IdempotencyKey): Promise<Comment | null>;
     savePublishedReply(
         reply: PublishedReply,
@@ -256,6 +253,18 @@ interface CommentRepository {
     saveMany(
         comments: readonly NormalizedComment[],
     ): Promise<readonly Comment[]>;
+}
+
+interface PublishedPostRepository {
+    findContextByPostId(
+        postId: PostId,
+    ): Promise<PublishedPostContext | null>;
+}
+
+interface CommentReplyContextRepository {
+    findByCommentId(
+        commentId: CommentId,
+    ): Promise<CommentReplyContext | null>;
 }
 
 interface SocialCommentsGateway {
@@ -273,6 +282,8 @@ interface SocialCommentsGateway {
     >>;
 }
 ```
+
+The persistence port has no retrieval methods, because the platform owns published content: a page of comments is read from the platform and then projected locally, never read back from the projection. Deciding which platform a request belongs to is a separate and deliberately narrow responsibility, so one port resolves the platform binding of a published post and another resolves the reply context of a comment. Neither is a generic repository, and neither is reused as one.
 
 Internal identity, optimistic-locking versions, and local timestamps are owned by the store. A persistence operation that assigns or preserves internal identity therefore returns the persisted entities rather than `void`, so the caller reports the same state that was stored.
 

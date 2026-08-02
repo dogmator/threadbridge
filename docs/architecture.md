@@ -65,6 +65,14 @@ Social-platform adapters:
 
 Application code must not branch on platform names. Adding a platform requires implementing the existing platform port and registering the adapter in the composition root.
 
+The demo gateway exists to prove the port end to end without credentials or network access. Its
+fixtures are static and its published replies live in the memory of one adapter instance, so they
+are forgotten when the process restarts. Because retrieval reports what the platform returns, a
+reply published before a restart is no longer listed afterwards, while the local projection and the
+idempotency guarantees, which are owned by PostgreSQL, survive it. That asymmetry belongs to the
+demonstrational adapter and not to the architecture: a real adapter queries a platform that keeps
+its own history.
+
 ## Persistence and consistency
 
 The external platform remains the source of truth for published comments and provider identifiers. PostgreSQL stores the latest known normalized projection.
