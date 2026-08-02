@@ -10,7 +10,10 @@ explicit Hexagonal Architecture with PostgreSQL projection storage and social-pl
   <img src="https://img.shields.io/badge/TypeScript-strict-3178C6?logo=typescript&logoColor=white" alt="TypeScript strict mode">
   <img src="https://img.shields.io/badge/PostgreSQL-18-4169E1?logo=postgresql&logoColor=white" alt="PostgreSQL 18">
   <img src="https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white" alt="Docker Compose local workflow">
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/License-MIT-green" alt="MIT License"></a>
 </p>
+
+> Created by **Pavko**.
 
 ## What it demonstrates
 
@@ -231,4 +234,6 @@ These are deliberate scope boundaries:
 
 - [Specification](./SPECIFICATION.md) — behavioral and architectural source of truth.
 - [Architecture notes](./docs/architecture.md) — boundaries, migrations, consistency, and shutdown.
+- [OpenAPI specification](./docs/openapi.yaml) — machine-readable HTTP contract.
 - [CI workflow](./.github/workflows/ci.yml) — the repository quality gate.
+- [MIT License](./LICENSE) — licensing terms.

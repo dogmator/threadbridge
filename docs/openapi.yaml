@@ -1,0 +1,556 @@
+openapi: 3.1.0
+
+info:
+  title: ThreadBridge API
+  version: 0.1.0
+  summary: Unified retrieval and publication of social-media comments.
+  description: |
+    ThreadBridge retrieves comments from published social-media posts and publishes replies through
+    one platform-independent REST API. A normalized projection is stored in PostgreSQL, while the
+    social platform remains the source of truth for published content, external identifiers, and
+    platform timestamps.
+
+    ## Idempotency
+
+    `POST /comments` requires an `Idempotency-Key` header, and two distinct guarantees apply to it.
+
+    The **local** guarantee is owned by ThreadBridge and is unconditional. PostgreSQL keeps at most
+    one comment row per idempotency key, concurrent requests carrying one key converge on that row
+    and report the same identifier, and a sequential replay is answered from the local projection
+    without calling the provider again. An identical replay returns `200` with the stored resource;
+    the same key with different input returns `409`.
+
+    The **external** guarantee — that one key produces at most one reply on the social platform —
+    can only be given by the platform. The provider call deliberately runs outside every database
+    transaction and lock, so two concurrent requests sharing a key may both reach the provider
+    adapter. The same key is passed to the provider for exactly that reason: an adapter forwards it
+    as the provider's own idempotency token or relies on an equivalent provider guarantee. Where no
+    such guarantee exists, ThreadBridge does not manufacture one, and this API must not be read as
+    promising exactly-once delivery.
+
+    When an adapter cannot determine whether the external write happened, the request fails with
+    `502 INDETERMINATE_PLATFORM_RESULT`. Nothing is persisted for that outcome and it is never
+    retried automatically.
+
+    ## Transport limits
+
+    The HTTP layer bounds untrusted input before any use case runs: request bodies are limited to
+    64 KiB measured in received bytes, an `Idempotency-Key` to 200 characters after trimming, reply
+    content to 10,000 characters, and a cursor to 4,096 characters. Content is measured but never
+    normalized or rewritten; the exact accepted bytes are what gets published and later compared.
+  license:
+    name: MIT
+    identifier: MIT
+
+servers:
+  - url: http://localhost:3000
+    description: Local Docker Compose environment.
+
+tags:
+  - name: Health
+    description: Liveness of the service itself.
+  - name: Comments
+    description: Retrieval of comments and publication of replies.
+
+paths:
+  /health:
+    get:
+      tags: [Health]
+      summary: Liveness check
+      description: Reports that the HTTP server is running. It does not check PostgreSQL or any provider.
+      operationId: getHealth
+      responses:
+        '200':
+          description: The service is running.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /posts/{postId}/comments:
+    get:
+      tags: [Comments]
+      summary: Retrieve root comments of a published post
+      description: |
+        Returns one page of root comments for the post. The page is requested from the social
+        platform, normalized, and saved idempotently into the local projection before it is
+        returned. The complete comment tree is never traversed.
+      operationId: getPostComments
+      parameters:
+        - $ref: '#/components/parameters/PostId'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: One page of root comments.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommentPage'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '404':
+          description: The post is unknown.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              examples:
+                postNotFound:
+                  value:
+                    error:
+                      code: POST_NOT_FOUND
+                      message: Post was not found
+                      requestId: 019fc3be-5155-7b43-aee4-63f580c05676
+        '422':
+          $ref: '#/components/responses/UnsupportedPlatform'
+        '429':
+          $ref: '#/components/responses/PlatformRateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/PlatformAuthenticationFailed'
+        '503':
+          $ref: '#/components/responses/PlatformUnavailable'
+
+  /comments/{commentId}/replies:
+    get:
+      tags: [Comments]
+      summary: Retrieve direct replies to a comment
+      description: |
+        Returns one page of direct children of the comment. Only direct replies are returned: the
+        endpoint never recursively resolves a subtree. Reply depth itself is unrestricted, so a
+        reply may be used as the parent of a further request.
+      operationId: getCommentReplies
+      parameters:
+        - $ref: '#/components/parameters/CommentId'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: One page of direct replies.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommentPage'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '404':
+          $ref: '#/components/responses/CommentNotFound'
+        '422':
+          $ref: '#/components/responses/UnsupportedPlatform'
+        '429':
+          $ref: '#/components/responses/PlatformRateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/PlatformAuthenticationFailed'
+        '503':
+          $ref: '#/components/responses/PlatformUnavailable'
+
+  /comments:
+    post:
+      tags: [Comments]
+      summary: Publish a reply to an existing comment
+      description: |
+        Publishes a reply through the provider that owns the parent comment, then stores the
+        confirmed reply in the local projection. The provider is called outside every PostgreSQL
+        transaction and lock.
+
+        The `Idempotency-Key` header is required. A first successful publication returns `201`. An
+        identical repeated request returns `200` with the same resource and does not call the
+        provider again. Reusing the key with a different parent or different content returns `409`.
+      operationId: publishReply
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        description: |
+          Must be sent as `application/json`. The media type is compared case-insensitively and
+          parameters such as `charset=utf-8` are accepted. The body may not exceed 64 KiB.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PublishReplyRequest'
+            examples:
+              reply:
+                value:
+                  parentCommentId: 0198f000-0000-7000-8000-0000000000ac
+                  content: Thank you for your comment
+      responses:
+        '201':
+          description: The reply was published and stored.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Comment'
+        '200':
+          description: |
+            An identical request with this idempotency key was already published. The stored
+            resource is returned unchanged and the provider is not called again.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Comment'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '404':
+          $ref: '#/components/responses/CommentNotFound'
+        '409':
+          description: The idempotency key was already used with different input.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              examples:
+                conflict:
+                  value:
+                    error:
+                      code: IDEMPOTENCY_CONFLICT
+                      message: Idempotency key conflicts with an existing request
+                      requestId: 019fc3be-5155-7b43-aee4-63f580c05676
+        '413':
+          description: The request body exceeded 64 KiB.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              examples:
+                tooLarge:
+                  value:
+                    error:
+                      code: PAYLOAD_TOO_LARGE
+                      message: Request body is too large
+                      requestId: 019fc3be-5155-7b43-aee4-63f580c05676
+        '415':
+          description: The request did not use the `application/json` media type.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              examples:
+                unsupportedMediaType:
+                  value:
+                    error:
+                      code: UNSUPPORTED_MEDIA_TYPE
+                      message: Content type must be application/json
+                      requestId: 019fc3be-5155-7b43-aee4-63f580c05676
+        '422':
+          $ref: '#/components/responses/UnsupportedPlatform'
+        '429':
+          $ref: '#/components/responses/PlatformRateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          description: |
+            The provider rejected authentication, or the outcome of the publication could not be
+            determined. An indeterminate outcome persists nothing and is never retried
+            automatically, because the write may already have succeeded on the provider.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              examples:
+                indeterminate:
+                  value:
+                    error:
+                      code: INDETERMINATE_PLATFORM_RESULT
+                      message: Platform result is indeterminate
+                      requestId: 019fc3be-5155-7b43-aee4-63f580c05676
+                authenticationFailed:
+                  value:
+                    error:
+                      code: PLATFORM_AUTHENTICATION_FAILED
+                      message: Platform authentication failed
+                      requestId: 019fc3be-5155-7b43-aee4-63f580c05676
+        '503':
+          $ref: '#/components/responses/PlatformUnavailable'
+
+components:
+  parameters:
+    PostId:
+      name: postId
+      in: path
+      required: true
+      description: Internal identifier of the published post.
+      schema:
+        type: string
+        format: uuid
+      example: 0198f000-0000-7000-8000-000000000002
+
+    CommentId:
+      name: commentId
+      in: path
+      required: true
+      description: Internal identifier of the comment.
+      schema:
+        type: string
+        format: uuid
+      example: 0198f000-0000-7000-8000-0000000000ac
+
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: |
+        Opaque continuation token taken from the `nextCursor` of a previous page. It is never
+        interpreted, decoded, or rewritten by the API and must be sent back exactly as received.
+        Omit it to request the first page.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 4096
+
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        Client-chosen key identifying this publication attempt. It is trimmed and must be non-empty
+        and at most 200 characters after trimming. The same key is passed on to the provider.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 200
+      example: my-key-1
+
+  schemas:
+    HealthResponse:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status:
+          type: string
+          const: ok
+      examples:
+        - status: ok
+
+    PublishReplyRequest:
+      type: object
+      additionalProperties: false
+      required: [parentCommentId, content]
+      properties:
+        parentCommentId:
+          type: string
+          format: uuid
+          description: Internal identifier of the comment being replied to. Any depth is accepted.
+        content:
+          type: string
+          minLength: 1
+          maxLength: 10000
+          description: |
+            Reply text. It must not be empty or whitespace only. It is never normalized: the exact
+            characters accepted here are published and later used for the idempotency comparison.
+
+    Comment:
+      type: object
+      additionalProperties: false
+      description: |
+        The public projection of a comment. Idempotency keys, optimistic-locking versions, and raw
+        provider metadata are deliberately absent, because they are internal or provider-owned.
+      required:
+        - id
+        - postId
+        - parentCommentId
+        - externalCommentId
+        - externalAuthorId
+        - content
+        - platformCreatedAt
+        - createdAt
+        - updatedAt
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Internal identifier assigned by ThreadBridge.
+        postId:
+          type: string
+          format: uuid
+          description: Internal identifier of the post this comment belongs to.
+        parentCommentId:
+          oneOf:
+            - type: string
+              format: uuid
+            - type: 'null'
+          description: Internal identifier of the parent comment, or null for a root comment.
+        externalCommentId:
+          type: string
+          description: Identifier of the comment on the social platform.
+        externalAuthorId:
+          type: string
+          description: Identifier of the author on the social platform.
+        content:
+          type: string
+        platformCreatedAt:
+          type: string
+          format: date-time
+          description: Creation timestamp reported by the social platform.
+        createdAt:
+          type: string
+          format: date-time
+          description: Timestamp at which the local projection first stored this comment.
+        updatedAt:
+          type: string
+          format: date-time
+          description: Timestamp of the last local projection update.
+
+    CommentPage:
+      type: object
+      additionalProperties: false
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Comment'
+        nextCursor:
+          oneOf:
+            - type: string
+            - type: 'null'
+          description: |
+            Opaque token for the following page, or null when this is the last page. Pass it back
+            unchanged as the `cursor` query parameter.
+
+    ErrorDetail:
+      type: object
+      additionalProperties: false
+      required: [code, message, requestId]
+      properties:
+        code:
+          type: string
+          description: Stable machine-readable error code.
+          enum:
+            - VALIDATION_ERROR
+            - UNSUPPORTED_MEDIA_TYPE
+            - PAYLOAD_TOO_LARGE
+            - ROUTE_NOT_FOUND
+            - POST_NOT_FOUND
+            - COMMENT_NOT_FOUND
+            - UNSUPPORTED_PLATFORM
+            - IDEMPOTENCY_CONFLICT
+            - PLATFORM_AUTHENTICATION_FAILED
+            - PLATFORM_RATE_LIMITED
+            - PLATFORM_UNAVAILABLE
+            - INDETERMINATE_PLATFORM_RESULT
+            - INTERNAL_ERROR
+        message:
+          type: string
+          description: |
+            Safe, static, human-readable description of the code. It never contains request input,
+            provider payloads, credentials, database details, or stack traces.
+        requestId:
+          type: string
+          description: Identifier generated for this error response, useful for correlation.
+
+    ErrorEnvelope:
+      type: object
+      additionalProperties: false
+      description: The single error envelope used by every failing request.
+      required: [error]
+      properties:
+        error:
+          $ref: '#/components/schemas/ErrorDetail'
+
+  responses:
+    ValidationError:
+      description: |
+        The request was rejected by the transport. Causes include a malformed UUID in the path, a
+        cursor longer than 4,096 characters, a missing or malformed JSON body, a missing, empty, or
+        over-long `Idempotency-Key`, and content that is empty, whitespace only, or longer than
+        10,000 characters.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          examples:
+            validationError:
+              value:
+                error:
+                  code: VALIDATION_ERROR
+                  message: Request validation failed
+                  requestId: 019fc3be-5155-7b43-aee4-63f580c05676
+
+    CommentNotFound:
+      description: The comment is unknown.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          examples:
+            commentNotFound:
+              value:
+                error:
+                  code: COMMENT_NOT_FOUND
+                  message: Comment was not found
+                  requestId: 019fc3be-5155-7b43-aee4-63f580c05676
+
+    UnsupportedPlatform:
+      description: No adapter is registered for the platform that owns this resource.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          examples:
+            unsupportedPlatform:
+              value:
+                error:
+                  code: UNSUPPORTED_PLATFORM
+                  message: Platform is not supported
+                  requestId: 019fc3be-5155-7b43-aee4-63f580c05676
+
+    PlatformRateLimited:
+      description: The social platform reported that a rate limit was exceeded.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          examples:
+            rateLimited:
+              value:
+                error:
+                  code: PLATFORM_RATE_LIMITED
+                  message: Platform rate limit was exceeded
+                  requestId: 019fc3be-5155-7b43-aee4-63f580c05676
+
+    PlatformAuthenticationFailed:
+      description: The social platform rejected the credentials of the connected account.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          examples:
+            authenticationFailed:
+              value:
+                error:
+                  code: PLATFORM_AUTHENTICATION_FAILED
+                  message: Platform authentication failed
+                  requestId: 019fc3be-5155-7b43-aee4-63f580c05676
+
+    PlatformUnavailable:
+      description: The social platform is unavailable.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          examples:
+            unavailable:
+              value:
+                error:
+                  code: PLATFORM_UNAVAILABLE
+                  message: Platform is unavailable
+                  requestId: 019fc3be-5155-7b43-aee4-63f580c05676
+
+    InternalError:
+      description: |
+        An unexpected failure. The response is deliberately uniform and carries no detail of what
+        failed beyond the request identifier.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          examples:
+            internalError:
+              value:
+                error:
+                  code: INTERNAL_ERROR
+                  message: Internal error
+                  requestId: 019fc3be-5155-7b43-aee4-63f580c05676
