@@ -140,6 +140,7 @@ describe('migrations', () => {
         expect(rows.map((row): string => row.name)).toEqual([
             '0001_initial_schema.sql',
             '0002_demo_seed.sql',
+            '0003_comment_parent_post_consistency.sql',
         ]);
         expect(rows.every((row): boolean => row.checksum.length === 64)).toBe(true);
     });
@@ -961,6 +962,176 @@ describe('ReplyToComment against real PostgreSQL', () => {
         expect(outcomes.filter((outcome): boolean => outcome === 'IDEMPOTENCY_CONFLICT'))
             .toHaveLength(1);
         expect(outcomes).toContain(rows.at(0)?.idempotency_key);
+    });
+});
+
+/**
+ * A controlled platform that deduplicates on its own side, the way a provider honouring an
+ * idempotency token does. The barrier holds both callers inside the publish call, so neither the
+ * local key lookup nor any PostgreSQL lock can be what prevents the second external effect: only
+ * the provider guarantee can.
+ */
+class ProviderIdempotentGateway implements SocialCommentsGateway {
+    public externalPublications = 0;
+
+    private readonly publishedByKey = new Map<string, PlatformComment>();
+
+    public constructor(private readonly barrier: Barrier) {}
+
+    public getComments(): never {
+        throw new Error('This gateway only publishes.');
+    }
+
+    public getReplies(): never {
+        throw new Error('This gateway only publishes.');
+    }
+
+    public async replyToComment(
+        input: ReplyToPlatformCommentInput,
+    ): Promise<Result<PlatformComment, PlatformFailure | IndeterminatePlatformResultFailure>> {
+        await this.barrier.arrive();
+
+        const alreadyPublished = this.publishedByKey.get(input.idempotencyKey);
+
+        if (alreadyPublished !== undefined) {
+            return ok<PlatformComment>(alreadyPublished);
+        }
+
+        this.externalPublications += 1;
+
+        const published: PlatformComment = {
+            externalCommentId: toExternalCommentId(`integration-provider-${input.idempotencyKey}`),
+            externalAuthorId: toExternalAuthorId('integration-author-self'),
+            content: input.content,
+            createdAt: platformCreatedAt,
+            metadata: null,
+        };
+
+        this.publishedByKey.set(input.idempotencyKey, published);
+
+        return ok<PlatformComment>(published);
+    }
+}
+
+describe('external publication under concurrency', () => {
+    it('creates one external publication for two concurrent requests with one key', async () => {
+        const comments = new PostgresCommentRepository(sql);
+        const contexts = new PostgresCommentReplyContextRepository(sql);
+        const [parent] = await comments.saveMany([importedComment('provider-idempotent', null)]);
+
+        if (parent === undefined) {
+            throw new Error('The parent comment was not persisted.');
+        }
+
+        const gateway = new ProviderIdempotentGateway(new Barrier(2));
+        const useCase = new ReplyToComment(
+            contexts,
+            new Map<SocialPlatform, SocialCommentsGateway>([[toSocialPlatform('demo'), gateway]]),
+            comments,
+        );
+        const key = toIdempotencyKey('integration-key-provider');
+        const request = {
+            parentCommentId: parent.id,
+            content: 'Concurrent publication',
+            idempotencyKey: key,
+        };
+
+        // Neither call rejects: a database exception would surface here as a rejected promise.
+        const results = await Promise.all([useCase.execute(request), useCase.execute(request)]);
+        const rows = await sql<IdRow[]>`
+            select id from comments where idempotency_key = ${key}
+        `;
+        const identifiers = results.map((result): string =>
+            result.ok ? result.value.comment.id : `failed:${result.error.code}`);
+
+        expect(gateway.externalPublications).toBe(1);
+        expect(results.every((result): boolean => result.ok)).toBe(true);
+        expect(new Set(identifiers).size).toBe(1);
+        expect(rows).toHaveLength(1);
+        expect(identifiers.at(0)).toBe(rows.at(0)?.id);
+    });
+});
+
+describe('comment parent and post consistency', () => {
+    const insertComment = async (
+        postId: string,
+        parentCommentId: string | null,
+        suffix: string,
+    ): Promise<readonly IdRow[]> =>
+        await sql<IdRow[]>`
+            insert into comments (
+                post_id, parent_comment_id, external_comment_id, external_author_id,
+                content, platform_created_at
+            ) values (
+                ${postId}, ${parentCommentId}, ${`integration-consistency-${suffix}`},
+                'integration-author-consistency', ${`Consistency ${suffix}`}, ${platformCreatedAt}
+            )
+            returning id
+        `;
+
+    it('accepts a root comment, a direct reply, and a reply to that reply', async () => {
+        const [root] = await insertComment(fixturePostId, null, 'root');
+
+        if (root === undefined) {
+            throw new Error('The root comment was not inserted.');
+        }
+
+        const [reply] = await insertComment(fixturePostId, root.id, 'reply');
+
+        if (reply === undefined) {
+            throw new Error('The reply was not inserted.');
+        }
+
+        const [deeper] = await insertComment(fixturePostId, reply.id, 'deeper');
+
+        expect(deeper?.id).toBeDefined();
+    });
+
+    it('rejects a reply whose parent belongs to another post', async () => {
+        const otherPosts = await sql<IdRow[]>`
+            insert into posts (account_id, external_post_id, published_at)
+            values (${fixtureAccountId}, 'integration-other-post', now())
+            on conflict (account_id, external_post_id) do update set updated_at = now()
+            returning id
+        `;
+        const otherPost = otherPosts.at(0);
+
+        if (otherPost === undefined) {
+            throw new Error('The second post fixture was not created.');
+        }
+
+        const [parent] = await insertComment(fixturePostId, null, 'cross-parent');
+
+        if (parent === undefined) {
+            throw new Error('The parent comment was not inserted.');
+        }
+
+        await expect(insertComment(otherPost.id, parent.id, 'cross-child')).rejects.toThrow(
+            /comments_parent_comment_same_post_fkey/u,
+        );
+
+        const orphans = await sql<IdRow[]>`
+            select id from comments where external_comment_id = 'integration-consistency-cross-child'
+        `;
+
+        expect(orphans).toEqual([]);
+    });
+
+    it('keeps the unique key that supports the composite reference', async () => {
+        const constraints = await sql<{conname: string}[]>`
+            select conname from pg_constraint
+            where conrelid = 'comments'::regclass
+              and conname in (
+                  'comments_id_post_id_key',
+                  'comments_parent_comment_same_post_fkey'
+              )
+            order by conname
+        `;
+
+        expect(constraints.map((row): string => row.conname)).toEqual([
+            'comments_id_post_id_key',
+            'comments_parent_comment_same_post_fkey',
+        ]);
     });
 });
 

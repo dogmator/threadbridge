@@ -19,6 +19,35 @@ interface ChecksumColumnRow {
 const checksumOf = (content: string): string =>
     createHash('sha256').update(content, 'utf8').digest('hex');
 
+const asError = (value: unknown): Error =>
+    value instanceof Error ? value : new Error('Migration failed with a non-Error value.');
+
+/**
+ * Runs one migration in its own transaction on the caller's session.
+ *
+ * The transaction is driven explicitly instead of through `sql.begin`, because the whole migration
+ * sequence runs on the single reserved session that holds the advisory lock, and the reserved
+ * handle of the checked-in postgres client exposes no `begin`. A failed rollback never replaces the
+ * failure that caused it.
+ */
+const inTransaction = async (sql: Sql, run: () => Promise<void>): Promise<void> => {
+    await sql`begin`;
+
+    try {
+        await run();
+        await sql`commit`;
+    } catch (error: unknown) {
+        try {
+            await sql`rollback`;
+        } catch {
+            // A rollback that cannot be sent means the session is already gone; the original
+            // migration failure is the one worth reporting.
+        }
+
+        throw error;
+    }
+};
+
 const namesOf = (rows: readonly MigrationNameRow[]): string =>
     rows.map((row): string => row.name).join(', ');
 
@@ -99,12 +128,20 @@ const ensureEveryAppliedMigrationExists = (
 };
 
 /**
+ * The key of the global ThreadBridge migration lock, as the two 32-bit halves PostgreSQL accepts.
+ * The namespace is the ASCII of "TB" followed by a version byte, which keeps it recognisable in
+ * `pg_locks` and unlikely to collide with an unrelated application sharing the database.
+ */
+const MIGRATION_LOCK_NAMESPACE = 0x54_42_00_01;
+const MIGRATION_LOCK_ID = 1;
+
+/**
  * Applies every pending migration in deterministic filename order, each one in its own
  * transaction. An already applied migration is verified against its recorded SHA-256 checksum and
  * is never re-applied or silently re-recorded, so an edited or deleted migration fails loudly
  * instead of drifting away from the deployed schema.
  */
-export const runMigrations = async (sql: Sql, directory: string): Promise<readonly string[]> => {
+const applyMigrations = async (sql: Sql, directory: string): Promise<readonly string[]> => {
     await sql`
         create table if not exists schema_migrations (
             name text primary key,
@@ -144,14 +181,70 @@ export const runMigrations = async (sql: Sql, directory: string): Promise<readon
             continue;
         }
 
-        await sql.begin(async (transaction): Promise<void> => {
-            await transaction.unsafe(content).simple();
-            await transaction`
+        await inTransaction(sql, async (): Promise<void> => {
+            await sql.unsafe(content).simple();
+            await sql`
                 insert into schema_migrations (name, checksum) values (${fileName}, ${checksum})
             `;
         });
 
         applied.push(fileName);
+    }
+
+    return applied;
+};
+
+/**
+ * Serializes the whole migration run across application instances.
+ *
+ * Every instance takes one session-level advisory lock on a reserved connection before it inspects
+ * the history and holds it until the last pending migration is applied, so two instances starting
+ * together cannot both run the same DDL: the second one waits, then observes a completed history
+ * and applies nothing. The lock is session-scoped rather than transaction-scoped precisely because
+ * each migration keeps its own transaction; wrapping every migration in one transaction to obtain
+ * a transaction-scoped lock would trade a real guarantee for a worse one.
+ *
+ * The lock is released whether the run succeeded, found an edited or missing migration, or failed
+ * inside a migration, and the original error is never replaced by a failure to release.
+ */
+export const runMigrations = async (sql: Sql, directory: string): Promise<readonly string[]> => {
+    const reserved = await sql.reserve();
+    let lockHeld = false;
+    let applied: readonly string[] = [];
+    let failure: Error | null = null;
+
+    try {
+        await reserved`
+            select pg_advisory_lock(${MIGRATION_LOCK_NAMESPACE}, ${MIGRATION_LOCK_ID})
+        `;
+        lockHeld = true;
+
+        applied = await applyMigrations(reserved, directory);
+    } catch (error: unknown) {
+        failure = asError(error);
+    } finally {
+        if (lockHeld) {
+            try {
+                await reserved`
+                    select pg_advisory_unlock(${MIGRATION_LOCK_NAMESPACE}, ${MIGRATION_LOCK_ID})
+                `;
+            } catch (error: unknown) {
+                // A broken session has already released its session-scoped lock. Preserve the
+                // original migration failure when there was one; otherwise report this release
+                // failure to the caller.
+                failure ??= asError(error);
+            }
+        }
+
+        try {
+            reserved.release();
+        } catch (error: unknown) {
+            failure ??= asError(error);
+        }
+    }
+
+    if (failure !== null) {
+        throw failure;
     }
 
     return applied;

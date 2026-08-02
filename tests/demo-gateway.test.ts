@@ -195,6 +195,40 @@ describe('DemoSocialCommentsGateway publication', () => {
         expect(second).toEqual(first);
     });
 
+    it('creates one external reply for concurrent publications of one key', async () => {
+        const gateway = new DemoSocialCommentsGateway();
+        // A parent without reply fixtures, so the single page returned holds only what is published
+        // here and the assertion cannot be satisfied by fixture data.
+        const parent = parentOf('demo-comment-2');
+        const input = {
+            accountId,
+            externalParentCommentId: parent,
+            content: 'Concurrent',
+            idempotencyKey: key('key-concurrent'),
+        };
+
+        // The adapter deduplicates on its own side, which is what an application-level guarantee
+        // cannot provide: the local database is not involved here at all.
+        const published = await Promise.all([
+            gateway.replyToComment(input),
+            gateway.replyToComment(input),
+            gateway.replyToComment(input),
+        ]);
+        const externalIds = published.map(
+            (result): string => publishedOf(result).externalCommentId,
+        );
+        const page = okPage(
+            await gateway.getReplies({
+                accountId,
+                externalParentCommentId: parent,
+                cursor: null,
+            }),
+        );
+
+        expect(new Set(externalIds).size).toBe(1);
+        expect(page.items.filter((item): boolean => item.content === 'Concurrent')).toHaveLength(1);
+    });
+
     it('creates no second external reply for a repeated key with different input', async () => {
         const gateway = new DemoSocialCommentsGateway();
         const parent = parentOf('demo-comment-2');

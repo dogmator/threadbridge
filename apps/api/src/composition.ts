@@ -14,6 +14,7 @@ import {PostgresCommentReplyContextRepository}
 import {PostgresCommentRepository} from './adapters/postgres/comment-repository.js';
 import {PostgresPublishedPostRepository} from './adapters/postgres/published-post-repository.js';
 import type {ApiServerDependencies} from './server.js';
+import {SHUTDOWN_GRACE_PERIOD_MS} from './shutdown.js';
 
 const DEMO_PLATFORM = toSocialPlatform('demo');
 
@@ -44,7 +45,7 @@ export const createApiComponents = (databaseUrl: string): ApiComponents => {
             replyToComment: new ReplyToComment(replyContexts, gateways, comments),
         },
         close: async (): Promise<void> => {
-            await sql.end();
+            await sql.end({timeout: SHUTDOWN_GRACE_PERIOD_MS / 1_000});
         },
     };
 };

@@ -17,7 +17,7 @@ The system must:
 - expose the functionality through a REST API;
 - persist a normalized local projection in PostgreSQL;
 - support cursor-based pagination;
-- prevent duplicate reply creation through idempotency;
+- prevent duplicate local reply creation through idempotency;
 - allow a new platform adapter to be added without changing application use cases.
 
 One demonstrational social-platform adapter is sufficient for the current implementation.
@@ -157,6 +157,8 @@ Required uniqueness:
 idempotency_key, when present
 ```
 
+A reply must belong to the same post as its parent. The invariant is declared in the schema through a unique key on `(id, post_id)` and a composite self-referencing foreign key from `(parent_comment_id, post_id)`, so a cross-post parent is rejected by PostgreSQL rather than only by application code. Root comments, whose parent is null, are unaffected, and reply depth stays unrestricted.
+
 ## 7. REST API
 
 ### Retrieve root comments
@@ -240,6 +242,16 @@ For `POST /comments`, the application:
 
 The current implementation does not automatically retry an operation when the external result is indeterminate and the platform does not guarantee idempotency.
 
+### Scope of the idempotency guarantee
+
+Two guarantees are involved, and only one of them belongs to this application.
+
+The *local* guarantee is owned by ThreadBridge and is unconditional: at most one comment row exists per idempotency key, concurrent requests carrying one key converge on that row and report the same identifier, a repeated request with identical input replays it, and the same key with different input is a conflict. It is enforced by a partial unique index and a transaction-scoped advisory lock taken after the platform has answered.
+
+The *external* guarantee — that one key produces at most one reply on the social platform — can only be given by the platform. The application deliberately holds no database transaction and no lock across the external call, so two concurrent requests sharing a key may both reach the adapter. The idempotency key is passed to the adapter for exactly that reason: an adapter forwards it as the provider's idempotency token, or otherwise relies on an equivalent provider guarantee. The demo adapter deduplicates on its own side and is therefore externally idempotent. An adapter that cannot do this must not be described as exactly-once, and must report `INDETERMINATE_PLATFORM_RESULT` when it cannot tell whether the external write happened.
+
+Migration execution is serialized across application instances by a global advisory lock, so several instances starting together apply pending migrations exactly once.
+
 ## 10. Application ports
 
 The minimum application-facing contracts are conceptually equivalent to:
@@ -321,9 +333,24 @@ The REST API uses one error envelope:
 }
 ```
 
+### Transport limits
+
+The HTTP layer bounds untrusted input before any use case runs:
+
+```text
+request body            64 KiB, measured in received bytes
+Idempotency-Key         200 characters after trimming
+reply content           10,000 characters
+cursor                  4,096 characters
+```
+
+`POST /comments` requires the `application/json` media type, compared case-insensitively and accepting parameters such as a charset. Accepted content is never normalized or rewritten: whitespace decides only whether content is empty, and the exact bytes accepted are what gets published and compared for idempotency.
+
 Required error categories include:
 
 - validation error;
+- unsupported media type;
+- payload too large;
 - comment not found;
 - post not found;
 - unsupported platform;
@@ -333,6 +360,8 @@ Required error categories include:
 - idempotency conflict;
 - indeterminate platform result;
 - internal error.
+
+Validation, unsupported media type, payload too large, internal error, and unknown route are transport-local: they are produced by the HTTP layer, never become application failures, and are not part of the core failure union.
 
 Application and domain failures are machine-readable: each carries its error code and the structured
 fields that identify the failure, and never a client-facing message. The HTTP layer owns the mapping

@@ -28,6 +28,26 @@ interface RelationRow {
     readonly relation: string | null;
 }
 
+interface CountRow {
+    readonly count: string;
+}
+
+/** The advisory-lock key runMigrations takes, mirrored here to observe it in pg_locks. */
+const MIGRATION_LOCK_NAMESPACE = 0x54_42_00_01;
+const MIGRATION_LOCK_ID = 1;
+
+const heldMigrationLocks = async (sql: Sql): Promise<number> => {
+    const rows = await sql<CountRow[]>`
+        select count(*)::text as count from pg_locks
+        where locktype = 'advisory'
+          and classid = ${MIGRATION_LOCK_NAMESPACE}
+          and objid = ${MIGRATION_LOCK_ID}
+          and granted
+    `;
+
+    return Number.parseInt(rows.at(0)?.count ?? '0', 10);
+};
+
 /**
  * Runs one scenario against a private PostgreSQL schema and a private migration directory. A
  * history that has to be broken on purpose therefore never touches the schema the rest of the
@@ -59,6 +79,40 @@ const withMigrationScenario = async (
     }
 };
 
+/**
+ * The same private schema, reached through two independent clients, which is what two application
+ * instances starting against one database look like from PostgreSQL's side.
+ */
+const withTwoInstances = async (
+    use: (first: Sql, second: Sql, directory: string) => Promise<void>,
+): Promise<void> => {
+    schemaIndex += 1;
+
+    const schema = `migration_race_${String(process.pid)}_${String(schemaIndex)}`;
+    const directory = await mkdtemp(join(tmpdir(), 'threadbridge-migrations-'));
+    const connect = (): Sql =>
+        postgres(databaseUrl, {
+            max: 1,
+            onnotice: (): void => undefined,
+            connection: {search_path: schema},
+        });
+
+    await admin`drop schema if exists ${admin(schema)} cascade`;
+    await admin`create schema ${admin(schema)}`;
+
+    const first = connect();
+    const second = connect();
+
+    try {
+        await use(first, second, directory);
+    } finally {
+        await first.end();
+        await second.end();
+        await admin`drop schema if exists ${admin(schema)} cascade`;
+        await rm(directory, {recursive: true, force: true});
+    }
+};
+
 const recordsOf = async (sql: Sql): Promise<readonly MigrationRecordRow[]> =>
     await sql<MigrationRecordRow[]>`select name, checksum from schema_migrations order by name`;
 
@@ -81,10 +135,15 @@ describe('runMigrations', () => {
             const applied = await runMigrations(sql, checkedInMigrations);
             const records = await recordsOf(sql);
 
-            expect(applied).toEqual(['0001_initial_schema.sql', '0002_demo_seed.sql']);
+            expect(applied).toEqual([
+                '0001_initial_schema.sql',
+                '0002_demo_seed.sql',
+                '0003_comment_parent_post_consistency.sql',
+            ]);
             expect(records.map((record): string => record.name)).toEqual([
                 '0001_initial_schema.sql',
                 '0002_demo_seed.sql',
+                '0003_comment_parent_post_consistency.sql',
             ]);
             expect(records.every((record): boolean => record.checksum?.length === 64)).toBe(true);
         });
@@ -229,6 +288,111 @@ describe('runMigrations', () => {
             const records = await recordsOf(sql);
 
             expect(records.at(0)?.checksum).toBeNull();
+        });
+    });
+});
+
+describe('runMigrations across instances', () => {
+    it('lets only one of two concurrent instances apply a pending migration', async () => {
+        await withTwoInstances(async (first, second, directory): Promise<void> => {
+            // The sleep is the synchronization point: whichever instance takes the lock holds it
+            // long enough that the other is certainly waiting rather than merely scheduled later.
+            // Neither statement tolerates being run twice, so a duplicate run cannot pass silently.
+            await writeFile(
+                join(directory, '0001_concurrent.sql'),
+                'select pg_sleep(0.25);\ncreate table concurrent_probe (id integer);\n',
+            );
+
+            const results = await Promise.all([
+                runMigrations(first, directory),
+                runMigrations(second, directory),
+            ]);
+            const applied = results.flat();
+            const records = await recordsOf(first);
+            const relations = await first<RelationRow[]>`
+                select to_regclass('concurrent_probe')::text as relation
+            `;
+
+            expect(applied).toEqual(['0001_concurrent.sql']);
+            expect(results.filter((result): boolean => result.length === 0)).toHaveLength(1);
+            expect(records).toHaveLength(1);
+            expect(records.at(0)?.name).toBe('0001_concurrent.sql');
+            expect(relations.at(0)?.relation).not.toBeNull();
+        });
+    });
+
+    it('releases the lock when the run succeeds', async () => {
+        await withTwoInstances(async (first, second, directory): Promise<void> => {
+            await writeFile(join(directory, '0001_probe.sql'), 'create table probe (id integer);\n');
+
+            await runMigrations(first, directory);
+
+            expect(await heldMigrationLocks(second)).toBe(0);
+        });
+    });
+
+    it('releases the lock after a failing migration and reports the original error', async () => {
+        await withTwoInstances(async (first, second, directory): Promise<void> => {
+            const file = join(directory, '0001_broken.sql');
+
+            await writeFile(file, 'create table broken (id integer);\nthis is not valid sql;\n');
+
+            await expect(runMigrations(first, directory)).rejects.toThrow(/syntax error/iu);
+
+            expect(await heldMigrationLocks(second)).toBe(0);
+            expect(await recordsOf(second)).toEqual([]);
+
+            // The lock is free, so a corrected run proceeds instead of waiting for a lost holder.
+            await writeFile(file, 'create table repaired (id integer);\n');
+
+            const applied = await runMigrations(second, directory);
+            const relations = await second<RelationRow[]>`
+                select to_regclass('repaired')::text as relation
+            `;
+
+            expect(applied).toEqual(['0001_broken.sql']);
+            expect(relations.at(0)?.relation).not.toBeNull();
+            expect(await heldMigrationLocks(first)).toBe(0);
+        });
+    });
+
+    it('rolls back and releases the lock when commit rejects a deferred constraint', async () => {
+        await withTwoInstances(async (first, second, directory): Promise<void> => {
+            const file = join(directory, '0001_deferred.sql');
+
+            await writeFile(
+                file,
+                'create table migration_parent (id integer primary key);\n'
+                + 'create table migration_child (parent_id integer references migration_parent (id) '
+                + 'deferrable initially deferred);\n'
+                + 'insert into migration_child (parent_id) values (1);\n',
+            );
+
+            await expect(runMigrations(first, directory)).rejects.toThrow(/foreign key/iu);
+
+            expect(await heldMigrationLocks(second)).toBe(0);
+            expect(await recordsOf(second)).toEqual([]);
+
+            await writeFile(file, 'create table repaired_after_commit_failure (id integer);\n');
+
+            expect(await runMigrations(second, directory)).toEqual(['0001_deferred.sql']);
+            expect(await heldMigrationLocks(first)).toBe(0);
+        });
+    });
+
+    it('releases the lock when validation rejects the history', async () => {
+        await withTwoInstances(async (first, second, directory): Promise<void> => {
+            const file = join(directory, '0001_probe.sql');
+
+            await writeFile(file, 'create table probe (id integer);\n');
+            await runMigrations(first, directory);
+            await rm(file);
+
+            await expect(runMigrations(first, directory)).rejects.toThrow(
+                /Applied migrations are missing/u,
+            );
+
+            expect(await heldMigrationLocks(second)).toBe(0);
         });
     });
 });
