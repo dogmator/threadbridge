@@ -16,7 +16,7 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint . --max-warnings=0",
     "lint:fix": "eslint . --fix --max-warnings=0",
-    "check": "npm run typecheck && npm run lint"
+    "check": "npm run typecheck && npm run lint && vitest run"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
