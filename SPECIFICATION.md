@@ -251,12 +251,18 @@ interface CommentRepository {
     findById(id: CommentId): Promise<Comment | null>;
     findByIdempotencyKey(key: IdempotencyKey): Promise<Comment | null>;
     save(comment: Comment): Promise<void>;
-    saveMany(comments: readonly Comment[]): Promise<void>;
+    saveMany(
+        comments: readonly NormalizedComment[],
+    ): Promise<readonly Comment[]>;
 }
 
 interface SocialCommentsGateway {
-    getComments(input: GetPlatformCommentsInput): Promise<PlatformCommentPage>;
-    getReplies(input: GetPlatformRepliesInput): Promise<PlatformCommentPage>;
+    getComments(
+        input: GetPlatformCommentsInput,
+    ): Promise<Result<PlatformCommentPage, PlatformFailure>>;
+    getReplies(
+        input: GetPlatformRepliesInput,
+    ): Promise<Result<PlatformCommentPage, PlatformFailure>>;
     replyToComment(input: ReplyToPlatformCommentInput): Promise<PlatformComment>;
 }
 
@@ -264,6 +270,10 @@ interface TransactionManager {
     run<T>(operation: () => Promise<T>): Promise<T>;
 }
 ```
+
+Internal identity, optimistic-locking versions, and local timestamps are owned by the store. A persistence operation that assigns or preserves internal identity therefore returns the persisted entities rather than `void`, so the caller reports the same state that was stored.
+
+Platform gateways report expected failures as typed results rather than exceptions, so the application handles every declared failure mode exhaustively.
 
 A platform registry may be represented by a typed read-only map. A dedicated registry class is unnecessary until registry-specific behavior appears.
 
@@ -301,6 +311,12 @@ Required error categories include:
 - idempotency conflict;
 - indeterminate platform result;
 - internal error.
+
+Application and domain failures are machine-readable: each carries its error code and the structured
+fields that identify the failure, and never a client-facing message. The HTTP layer owns the mapping
+from an error code to its status and to its safe, static client-facing message, and it generates the
+`requestId`. Structured failure fields stay inside the application unless a mapping deliberately
+exposes them.
 
 Platform adapters translate external failures into internal typed errors.
 

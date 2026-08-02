@@ -237,8 +237,9 @@ describe('GetCommentReplies', () => {
 
         expect(result).toEqual({
             ok: false,
-            error: {code: 'COMMENT_NOT_FOUND', message: 'The requested comment was not found.'},
+            error: {code: 'COMMENT_NOT_FOUND', commentId: 'comment-parent'},
         });
+        expect(result).not.toHaveProperty('error.message');
         expect(gateway.receivedInputs).toEqual([]);
         expect(repository.savedBatches).toEqual([]);
     });
@@ -274,10 +275,7 @@ describe('GetCommentReplies', () => {
 
         expect(result).toEqual({
             ok: false,
-            error: {
-                code: 'UNSUPPORTED_PLATFORM',
-                message: 'The social platform of the requested comment is not supported.',
-            },
+            error: {code: 'UNSUPPORTED_PLATFORM', platform: 'other'},
         });
         expect(gateway.receivedInputs).toEqual([]);
         expect(repository.savedBatches).toEqual([]);
@@ -393,10 +391,7 @@ describe('GetCommentReplies', () => {
     it('returns the typed platform failure and persists nothing when the platform fails', async () => {
         const repository = new InMemoryCommentRepository();
         const gateway = new StubSocialCommentsGateway(
-            err<PlatformFailure>({
-                code: 'PLATFORM_UNAVAILABLE',
-                message: 'The platform is temporarily unavailable.',
-            }),
+            err<PlatformFailure>({code: 'PLATFORM_UNAVAILABLE'}),
         );
 
         const result = await useCaseFor(
@@ -407,10 +402,7 @@ describe('GetCommentReplies', () => {
 
         expect(result).toEqual({
             ok: false,
-            error: {
-                code: 'PLATFORM_UNAVAILABLE',
-                message: 'The platform is temporarily unavailable.',
-            },
+            error: {code: 'PLATFORM_UNAVAILABLE'},
         });
         expect(repository.savedBatches).toEqual([]);
     });

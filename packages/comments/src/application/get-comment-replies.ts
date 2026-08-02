@@ -39,7 +39,7 @@ export class GetCommentReplies {
         if (context === null) {
             return err<GetCommentRepliesFailure>({
                 code: 'COMMENT_NOT_FOUND',
-                message: 'The requested comment was not found.',
+                commentId: query.commentId,
             });
         }
 
@@ -48,7 +48,7 @@ export class GetCommentReplies {
         if (gateway === undefined) {
             return err<GetCommentRepliesFailure>({
                 code: 'UNSUPPORTED_PLATFORM',
-                message: 'The social platform of the requested comment is not supported.',
+                platform: context.platform,
             });
         }
 

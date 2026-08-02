@@ -6,18 +6,33 @@ The project focuses on clear architectural boundaries, strong type safety, exten
 
 ## Current status
 
-The repository currently contains the local infrastructure and the first tested HTTP endpoint:
+The repository contains the local infrastructure, the comments core, and one HTTP endpoint.
 
-- Node.js 24;
-- strict TypeScript;
-- ESLint with type-aware rules;
-- Vitest;
-- PostgreSQL 18;
-- Docker Compose;
+Implemented:
+
+- Node.js 24, strict TypeScript, type-aware ESLint, Vitest;
+- PostgreSQL 18 and Docker Compose;
 - automatic SQL migration execution;
+- normalized comments-domain types: branded identifiers, `Comment`, `NormalizedComment`,
+  cursor-based pages, and machine-readable failures;
+- `GetPostComments`, the root-comment retrieval use case, unit-tested against controlled ports;
+- `GetCommentReplies`, the direct-reply retrieval use case, unit-tested against controlled ports;
+- `@threadbridge/comments`, consumed by the API through its package entry point;
+- the HTTP error envelope and the failure-to-status mapping;
 - `GET /health`.
 
-The comment domain, platform adapters, persistence layer, and application use cases are specified but not yet implemented.
+Not implemented:
+
+- PostgreSQL repository adapters;
+- social-platform adapters;
+- the functional REST routes `GET /posts/:postId/comments`, `GET /comments/:commentId/replies`,
+  and `POST /comments`;
+- reply publication;
+- the composition root.
+
+The API therefore exposes only `GET /health`. Both retrieval use cases are complete and tested, but
+nothing wires them to HTTP yet, because no repository or platform adapter exists to inject. That
+wiring arrives with the first real adapters.
 
 ## Requirements
 

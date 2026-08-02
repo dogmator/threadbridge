@@ -39,7 +39,7 @@ export class GetPostComments {
         if (post === null) {
             return err<GetPostCommentsFailure>({
                 code: 'POST_NOT_FOUND',
-                message: 'The requested post was not found.',
+                postId: query.postId,
             });
         }
 
@@ -48,7 +48,7 @@ export class GetPostComments {
         if (gateway === undefined) {
             return err<GetPostCommentsFailure>({
                 code: 'UNSUPPORTED_PLATFORM',
-                message: 'The social platform of the requested post is not supported.',
+                platform: post.platform,
             });
         }
 

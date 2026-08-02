@@ -316,8 +316,9 @@ describe('GetPostComments', () => {
 
         expect(result).toEqual({
             ok: false,
-            error: {code: 'POST_NOT_FOUND', message: 'The requested post was not found.'},
+            error: {code: 'POST_NOT_FOUND', postId: 'post-1'},
         });
+        expect(result).not.toHaveProperty('error.message');
         expect(gateway.receivedInputs).toEqual([]);
         expect(repository.savedBatches).toEqual([]);
     });
@@ -325,10 +326,7 @@ describe('GetPostComments', () => {
     it('returns the typed platform failure and persists nothing when the platform fails', async () => {
         const repository = new InMemoryCommentRepository();
         const gateway = new StubSocialCommentsGateway(
-            err<PlatformFailure>({
-                code: 'PLATFORM_RATE_LIMITED',
-                message: 'The platform rate limit was exceeded.',
-            }),
+            err<PlatformFailure>({code: 'PLATFORM_RATE_LIMITED'}),
         );
 
         const result = await useCaseFor(
@@ -339,10 +337,7 @@ describe('GetPostComments', () => {
 
         expect(result).toEqual({
             ok: false,
-            error: {
-                code: 'PLATFORM_RATE_LIMITED',
-                message: 'The platform rate limit was exceeded.',
-            },
+            error: {code: 'PLATFORM_RATE_LIMITED'},
         });
         expect(repository.savedBatches).toEqual([]);
     });
@@ -362,10 +357,7 @@ describe('GetPostComments', () => {
 
         expect(result).toEqual({
             ok: false,
-            error: {
-                code: 'UNSUPPORTED_PLATFORM',
-                message: 'The social platform of the requested post is not supported.',
-            },
+            error: {code: 'UNSUPPORTED_PLATFORM', platform: 'other'},
         });
         expect(gateway.receivedInputs).toEqual([]);
         expect(repository.savedBatches).toEqual([]);

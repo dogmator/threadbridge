@@ -12,6 +12,7 @@ export type {Comment, CommentPage, NormalizedComment} from './domain/comment.js'
 export type {CommentReplyContext} from './domain/comment-reply.js';
 export type {
     CommentNotFoundFailure,
+    CommentsFailure,
     PlatformFailure,
     PostNotFoundFailure,
     UnsupportedPlatformFailure,

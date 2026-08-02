@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "dependencies": {
+    "@threadbridge/comments": "0.1.0",
     "postgres": "^3.4.9"
   }
 }
