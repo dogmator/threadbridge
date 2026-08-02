@@ -7,6 +7,11 @@ export type PlatformFailure =
     | {readonly code: 'PLATFORM_RATE_LIMITED'; readonly message: string}
     | {readonly code: 'PLATFORM_UNAVAILABLE'; readonly message: string};
 
+export interface CommentNotFoundFailure {
+    readonly code: 'COMMENT_NOT_FOUND';
+    readonly message: string;
+}
+
 export interface PostNotFoundFailure {
     readonly code: 'POST_NOT_FOUND';
     readonly message: string;

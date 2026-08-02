@@ -89,6 +89,10 @@ class StubSocialCommentsGateway implements SocialCommentsGateway {
 
         return Promise.resolve(this.response);
     }
+
+    public getReplies(): Promise<Result<PlatformCommentPage, PlatformFailure>> {
+        throw new Error('GetPostComments must not request replies.');
+    }
 }
 
 class InMemoryCommentRepository implements CommentRepository {

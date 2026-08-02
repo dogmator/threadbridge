@@ -1,10 +1,17 @@
+export {GetCommentReplies} from './application/get-comment-replies.js';
+export type {
+    GetCommentRepliesFailure,
+    GetCommentRepliesQuery,
+} from './application/get-comment-replies.js';
 export {GetPostComments} from './application/get-post-comments.js';
 export type {
     GetPostCommentsFailure,
     GetPostCommentsQuery,
 } from './application/get-post-comments.js';
 export type {Comment, CommentPage, NormalizedComment} from './domain/comment.js';
+export type {CommentReplyContext} from './domain/comment-reply.js';
 export type {
+    CommentNotFoundFailure,
     PlatformFailure,
     PostNotFoundFailure,
     UnsupportedPlatformFailure,
@@ -38,9 +45,11 @@ export type {
 export type {PublishedPostContext} from './domain/post.js';
 export {err, ok} from './domain/result.js';
 export type {Result} from './domain/result.js';
+export type {CommentReplyContextRepository} from './ports/comment-reply-context-repository.js';
 export type {CommentRepository} from './ports/comment-repository.js';
 export type {PublishedPostRepository} from './ports/published-post-repository.js';
 export type {
     GetPlatformCommentsInput,
+    GetPlatformRepliesInput,
     SocialCommentsGateway,
 } from './ports/social-comments-gateway.js';
