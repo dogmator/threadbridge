@@ -93,6 +93,10 @@ class StubSocialCommentsGateway implements SocialCommentsGateway {
     public getReplies(): Promise<Result<PlatformCommentPage, PlatformFailure>> {
         throw new Error('GetPostComments must not request replies.');
     }
+
+    public replyToComment(): never {
+        throw new Error('GetPostComments must not publish replies.');
+    }
 }
 
 class InMemoryCommentRepository implements CommentRepository {
@@ -110,6 +114,14 @@ class InMemoryCommentRepository implements CommentRepository {
 
     public get storedComments(): readonly Comment[] {
         return [...this.comments.values()];
+    }
+
+    public findByIdempotencyKey(): never {
+        throw new Error('Retrieval must not look up idempotency keys.');
+    }
+
+    public savePublishedReply(): never {
+        throw new Error('Retrieval must not publish replies.');
     }
 
     private upsert(comment: NormalizedComment): Comment {

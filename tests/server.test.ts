@@ -6,6 +6,7 @@ import {createApiServer, type ApiServerDependencies} from '../apps/api/src/serve
 import {
     GetCommentReplies,
     GetPostComments,
+    ReplyToComment,
     type Comment,
     type CommentReplyContext,
     type CommentReplyContextRepository,
@@ -28,12 +29,17 @@ const noReplyContexts: CommentReplyContextRepository = {
 
 const noComments: CommentRepository = {
     saveMany: (): Promise<readonly Comment[]> => Promise.resolve([]),
+    findByIdempotencyKey: (): Promise<Comment | null> => Promise.resolve(null),
+    savePublishedReply: (): never => {
+        throw new Error('These tests never publish a reply.');
+    },
 };
 
 const dependenciesWith = (requestIdFactory: () => string): ApiServerDependencies => ({
     requestIdFactory,
     getPostComments: new GetPostComments(noPosts, noGateways, noComments),
     getCommentReplies: new GetCommentReplies(noReplyContexts, noGateways, noComments),
+    replyToComment: new ReplyToComment(noReplyContexts, noGateways, noComments),
 });
 
 class CountingRequestIdFactory {

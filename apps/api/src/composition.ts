@@ -2,6 +2,7 @@ import {randomUUID} from 'node:crypto';
 import {
     GetCommentReplies,
     GetPostComments,
+    ReplyToComment,
     toSocialPlatform,
     type SocialCommentsGateway,
     type SocialPlatform,
@@ -40,6 +41,7 @@ export const createApiComponents = (databaseUrl: string): ApiComponents => {
             requestIdFactory: randomUUID,
             getPostComments: new GetPostComments(publishedPosts, gateways, comments),
             getCommentReplies: new GetCommentReplies(replyContexts, gateways, comments),
+            replyToComment: new ReplyToComment(replyContexts, gateways, comments),
         },
         close: async (): Promise<void> => {
             await sql.end();

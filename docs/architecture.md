@@ -75,16 +75,37 @@ Repeated synchronization of the same external comment must not create duplicates
 
 Reply publication is synchronous:
 
-1. validate the request body and the idempotency key;
-2. load the parent comment, its post, and the connected account;
-3. check whether the idempotency key was already used;
-4. resolve the platform adapter and call the external platform outside a database transaction;
-5. persist the confirmed result in a short transaction;
-6. return the normalized reply.
+1. the transport validates the request body and the `Idempotency-Key` header;
+2. the reply context is resolved from the internal parent comment identifier;
+3. an existing comment is looked up by idempotency key;
+4. a match on parent and exact content replays the stored reply; any other match is a conflict;
+5. the platform adapter is resolved and called outside every database transaction;
+6. the confirmed reply is persisted by one atomic statement;
+7. the persisted row is compared with the request once more, because a concurrent request carrying
+   the same key may have stored first;
+8. the reply is returned as created or as already existing.
 
-The same idempotency key with the same input returns the existing result. Reusing the key with different input produces a conflict.
+The same idempotency key with the same parent and the exact same content returns the existing
+result, and a sequential replay never calls the platform twice. Reusing the key with a different
+parent or different content produces a conflict.
 
-When the external result is indeterminate and provider idempotency is unknown, the application returns a typed error rather than retrying automatically.
+### Idempotency and concurrency
+
+One local row exists per idempotency key: a partial unique index enforces it, and the publication
+statement converges concurrent writers onto a single row rather than failing. A reply already
+imported by retrieval is reconciled instead of duplicated, and a recorded key is never replaced.
+
+The guarantee is deliberately local. Without provider idempotency, reservation states,
+reconciliation, or an outbox, an external call may complete while its outcome stays unknown. That
+case is reported as a typed indeterminate result, nothing is persisted, and nothing is retried
+automatically. This is the intended current behavior, not an omission.
+
+### Why no transaction manager
+
+Every implemented write is a single statement that PostgreSQL already executes atomically, so no
+use case needs to compose two writes. The external call happens before persistence and never runs
+inside a transaction, which is precisely what a transaction manager must not be allowed to make
+easy. An abstraction is added when behavior requires it.
 
 ## Dependency direction
 

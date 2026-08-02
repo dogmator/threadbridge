@@ -36,6 +36,15 @@ export interface Comment extends NormalizedComment {
     readonly idempotencyKey?: IdempotencyKey;
 }
 
+/**
+ * A reply confirmed by a platform and ready to be projected locally. Unlike an imported comment it
+ * always has a parent and always carries the idempotency key of the request that published it.
+ */
+export interface PublishedReply extends NormalizedComment {
+    readonly parentCommentId: CommentId;
+    readonly idempotencyKey: IdempotencyKey;
+}
+
 export interface CommentPage {
     readonly items: readonly Comment[];
     readonly nextCursor: Cursor | null;

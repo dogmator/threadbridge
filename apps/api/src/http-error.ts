@@ -62,5 +62,19 @@ export const toHttpErrorResponse = (
                 status: 503,
                 body: toErrorEnvelope(failure.code, 'Platform is unavailable', requestId),
             };
+        case 'IDEMPOTENCY_CONFLICT':
+            return {
+                status: 409,
+                body: toErrorEnvelope(
+                    failure.code,
+                    'Idempotency key conflicts with an existing request',
+                    requestId,
+                ),
+            };
+        case 'INDETERMINATE_PLATFORM_RESULT':
+            return {
+                status: 502,
+                body: toErrorEnvelope(failure.code, 'Platform result is indeterminate', requestId),
+            };
     }
 };

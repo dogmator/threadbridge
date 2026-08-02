@@ -2,6 +2,7 @@ import {describe, expect, it} from 'vitest';
 import {toHttpErrorResponse} from '../apps/api/src/http-error.js';
 import {
     toCommentId,
+    toIdempotencyKey,
     toPostId,
     toSocialPlatform,
     type CommentsFailure,
@@ -24,6 +25,14 @@ const failures: {
     PLATFORM_AUTHENTICATION_FAILED: {code: 'PLATFORM_AUTHENTICATION_FAILED'},
     PLATFORM_RATE_LIMITED: {code: 'PLATFORM_RATE_LIMITED'},
     PLATFORM_UNAVAILABLE: {code: 'PLATFORM_UNAVAILABLE'},
+    IDEMPOTENCY_CONFLICT: {
+        code: 'IDEMPOTENCY_CONFLICT',
+        idempotencyKey: toIdempotencyKey('key-1'),
+    },
+    INDETERMINATE_PLATFORM_RESULT: {
+        code: 'INDETERMINATE_PLATFORM_RESULT',
+        platform: toSocialPlatform('demo'),
+    },
 };
 
 const expected = {
@@ -33,6 +42,11 @@ const expected = {
     PLATFORM_AUTHENTICATION_FAILED: {status: 502, message: 'Platform authentication failed'},
     PLATFORM_RATE_LIMITED: {status: 429, message: 'Platform rate limit was exceeded'},
     PLATFORM_UNAVAILABLE: {status: 503, message: 'Platform is unavailable'},
+    IDEMPOTENCY_CONFLICT: {
+        status: 409,
+        message: 'Idempotency key conflicts with an existing request',
+    },
+    INDETERMINATE_PLATFORM_RESULT: {status: 502, message: 'Platform result is indeterminate'},
 } as const satisfies Record<CommentsFailure['code'], {status: number; message: string}>;
 
 describe('toHttpErrorResponse', () => {
@@ -59,5 +73,16 @@ describe('toHttpErrorResponse', () => {
 
         expect(Object.keys(response.body.error)).toEqual(['code', 'message', 'requestId']);
         expect(JSON.stringify(response.body)).not.toContain('post-1');
+    });
+
+    it('never leaks the idempotency key or the platform of a publication failure', () => {
+        const conflict = toHttpErrorResponse(failures.IDEMPOTENCY_CONFLICT, 'request-1');
+        const indeterminate = toHttpErrorResponse(
+            failures.INDETERMINATE_PLATFORM_RESULT,
+            'request-1',
+        );
+
+        expect(JSON.stringify(conflict.body)).not.toContain('key-1');
+        expect(JSON.stringify(indeterminate.body)).not.toContain('demo');
     });
 });

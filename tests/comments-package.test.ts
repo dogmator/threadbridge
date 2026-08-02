@@ -126,6 +126,10 @@ describe('@threadbridge/comments package entry point', () => {
         };
         const comments: CommentRepository = {
             saveMany: (): Promise<readonly Comment[]> => Promise.resolve([]),
+            findByIdempotencyKey: (): Promise<Comment | null> => Promise.resolve(null),
+            savePublishedReply: (): never => {
+                throw new Error('This test never publishes a reply.');
+            },
         };
         const gateways = new Map<SocialPlatform, SocialCommentsGateway>();
 

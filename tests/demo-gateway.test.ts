@@ -7,12 +7,15 @@ import {
     toCursor,
     toExternalCommentId,
     toExternalPostId,
+    toIdempotencyKey,
     toPostId,
     toSocialPlatform,
     type Comment,
     type CommentRepository,
     type Cursor,
     type NormalizedComment,
+    type IndeterminatePlatformResultFailure,
+    type PlatformComment,
     type PlatformCommentPage,
     type PlatformFailure,
     type PublishedPostContext,
@@ -137,6 +140,172 @@ describe('DemoSocialCommentsGateway', () => {
     });
 });
 
+const key = (value: string): ReturnType<typeof toIdempotencyKey> => toIdempotencyKey(value);
+
+const publishedOf = (
+    result: Result<PlatformComment, PlatformFailure | IndeterminatePlatformResultFailure>,
+): PlatformComment => {
+    if (!result.ok) {
+        throw new Error(`Expected a published reply, received ${result.error.code}.`);
+    }
+
+    return result.value;
+};
+
+const publicationFailureOf = (
+    result: Result<PlatformComment, PlatformFailure | IndeterminatePlatformResultFailure>,
+): PlatformFailure | IndeterminatePlatformResultFailure => {
+    if (result.ok) {
+        throw new Error('Expected a platform failure.');
+    }
+
+    return result.error;
+};
+
+const parentOf = (value: string): ReturnType<typeof toExternalCommentId> =>
+    toExternalCommentId(value);
+
+describe('DemoSocialCommentsGateway publication', () => {
+    it('publishes a deterministic reply', async () => {
+        const published = publishedOf(
+            await new DemoSocialCommentsGateway().replyToComment({
+                accountId,
+                externalParentCommentId: parentOf('demo-comment-1'),
+                content: 'Thank you',
+                idempotencyKey: key('key-1'),
+            }),
+        );
+
+        expect(published.externalCommentId).toBe('demo-published-key-1');
+        expect(published.content).toBe('Thank you');
+    });
+
+    it('returns the original reply for a repeated key with identical input', async () => {
+        const gateway = new DemoSocialCommentsGateway();
+        const input = {
+            accountId,
+            externalParentCommentId: parentOf('demo-comment-1'),
+            content: 'Thank you',
+            idempotencyKey: key('key-2'),
+        };
+
+        const first = publishedOf(await gateway.replyToComment(input));
+        const second = publishedOf(await gateway.replyToComment(input));
+
+        expect(second).toEqual(first);
+    });
+
+    it('creates no second external reply for a repeated key with different input', async () => {
+        const gateway = new DemoSocialCommentsGateway();
+        const parent = parentOf('demo-comment-2');
+
+        await gateway.replyToComment({
+            accountId,
+            externalParentCommentId: parent,
+            content: 'Original',
+            idempotencyKey: key('key-3'),
+        });
+        const second = publishedOf(
+            await gateway.replyToComment({
+                accountId,
+                externalParentCommentId: parent,
+                content: 'Changed',
+                idempotencyKey: key('key-3'),
+            }),
+        );
+        const page = okPage(
+            await gateway.getReplies({
+                accountId,
+                externalParentCommentId: parent,
+                cursor: null,
+            }),
+        );
+
+        expect(second.content).toBe('Original');
+        expect(page.items).toHaveLength(1);
+    });
+
+    it('returns a published reply through getReplies', async () => {
+        const gateway = new DemoSocialCommentsGateway();
+        const parent = parentOf('demo-comment-3');
+
+        const published = publishedOf(
+            await gateway.replyToComment({
+                accountId,
+                externalParentCommentId: parent,
+                content: 'Visible afterwards',
+                idempotencyKey: key('key-4'),
+            }),
+        );
+        const page = okPage(
+            await gateway.getReplies({accountId, externalParentCommentId: parent, cursor: null}),
+        );
+
+        expect(page.items.map((item): string => item.externalCommentId)).toEqual([
+            published.externalCommentId,
+        ]);
+    });
+
+    it('publishes a reply to a reply', async () => {
+        const gateway = new DemoSocialCommentsGateway();
+
+        const published = publishedOf(
+            await gateway.replyToComment({
+                accountId,
+                externalParentCommentId: parentOf('demo-comment-1-reply-1'),
+                content: 'Deeper',
+                idempotencyKey: key('key-5'),
+            }),
+        );
+        const page = okPage(
+            await gateway.getReplies({
+                accountId,
+                externalParentCommentId: parentOf('demo-comment-1-reply-1'),
+                cursor: null,
+            }),
+        );
+
+        expect(page.items.map((item): string => item.externalCommentId)).toEqual([
+            published.externalCommentId,
+        ]);
+    });
+
+    it('does not add a published reply to the root comment fixtures', async () => {
+        const gateway = new DemoSocialCommentsGateway();
+
+        await gateway.replyToComment({
+            accountId,
+            externalParentCommentId: parentOf('demo-comment-1'),
+            content: 'Not a root comment',
+            idempotencyKey: key('key-6'),
+        });
+        const roots = okPage(
+            await gateway.getComments({accountId, externalPostId: demoPost, cursor: null}),
+        );
+
+        expect(roots.items.map((item): string => item.externalCommentId)).toEqual([
+            'demo-comment-1',
+            'demo-comment-2',
+        ]);
+    });
+
+    it.each([
+        ['demo-authentication-failure', 'PLATFORM_AUTHENTICATION_FAILED'],
+        ['demo-rate-limited', 'PLATFORM_RATE_LIMITED'],
+        ['demo-unavailable', 'PLATFORM_UNAVAILABLE'],
+        ['demo-indeterminate', 'INDETERMINATE_PLATFORM_RESULT'],
+    ])('translates %s into %s', async (parent: string, code: string) => {
+        const result = await new DemoSocialCommentsGateway().replyToComment({
+            accountId,
+            externalParentCommentId: parentOf(parent),
+            content: 'Whatever',
+            idempotencyKey: key(`key-${parent}`),
+        });
+
+        expect(publicationFailureOf(result).code).toBe(code);
+    });
+});
+
 describe('platform registration', () => {
     it('routes to a second registered gateway without changing application code', async () => {
         const secondPlatform = toSocialPlatform('second');
@@ -161,12 +330,21 @@ describe('platform registration', () => {
             },
             getReplies: (): Promise<Result<PlatformCommentPage, PlatformFailure>> =>
                 Promise.resolve({ok: true, value: {items: [], nextCursor: null}}),
+            replyToComment: (): never => {
+                throw new Error('Retrieval must not publish replies.');
+            },
         });
         const comments: CommentRepository = {
             saveMany: (stored: readonly NormalizedComment[]): Promise<readonly Comment[]> => {
                 expect(stored).toEqual([]);
 
                 return Promise.resolve([]);
+            },
+            findByIdempotencyKey: (): never => {
+                throw new Error('Retrieval must not look up idempotency keys.');
+            },
+            savePublishedReply: (): never => {
+                throw new Error('Retrieval must not publish replies.');
             },
         };
         const useCase = new GetPostComments(

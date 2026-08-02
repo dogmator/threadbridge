@@ -6,8 +6,8 @@ The project focuses on clear architectural boundaries, strong type safety, exten
 
 ## Current status
 
-Comment retrieval works end to end: HTTP, application use cases, PostgreSQL, and a social-platform
-gateway are connected.
+All three required endpoints work end to end: HTTP, application use cases, PostgreSQL, and a
+social-platform gateway are connected.
 
 Implemented:
 
@@ -21,14 +21,14 @@ Implemented:
 - PostgreSQL repository adapters, including an idempotent import that never duplicates a comment;
 - a deterministic demo social-platform gateway with fixture data, opaque cursors, and typed
   failure translation;
+- `ReplyToComment`, publishing a reply with idempotent replay and conflict detection;
 - a composition root wiring HTTP, use cases, repositories, and the platform registry;
-- `GET /health`, `GET /posts/:postId/comments`, and `GET /comments/:commentId/replies`;
-- the uniform HTTP error envelope.
+- `GET /health`, `GET /posts/:postId/comments`, `GET /comments/:commentId/replies`, and
+  `POST /comments`;
+- the uniform HTTP error envelope, including transport-local validation errors.
 
 Not implemented:
 
-- reply publication and `POST /comments`;
-- idempotency-key handling and conflict detection;
 - any real social-platform adapter; only the demo gateway exists;
 - account and post administration. The demo account and demo post are created by a seed migration,
   because the specification defines no endpoint that creates them.
@@ -43,7 +43,16 @@ curl http://localhost:3000/health
 curl http://localhost:3000/posts/0198f000-0000-7000-8000-000000000002/comments
 curl "http://localhost:3000/posts/0198f000-0000-7000-8000-000000000002/comments?cursor=<nextCursor>"
 curl http://localhost:3000/comments/<id returned above>/replies
+
+curl -X POST http://localhost:3000/comments \
+  -H 'content-type: application/json' \
+  -H 'idempotency-key: my-key-1' \
+  -d '{"parentCommentId":"<id returned above>","content":"Thank you for your comment"}'
 ```
+
+Publishing is idempotent: repeating that exact request returns `200` with the same resource, while
+reusing the key with different content returns `409`. An unknown external outcome is reported as
+`502 INDETERMINATE_PLATFORM_RESULT` and is never retried automatically.
 
 ## Requirements
 

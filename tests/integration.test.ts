@@ -1,4 +1,5 @@
 import {once} from 'node:events';
+import {setTimeout} from 'node:timers/promises';
 import {mkdtemp, rm, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join, resolve} from 'node:path';
@@ -13,18 +14,32 @@ import {PostgresPublishedPostRepository}
 import {createApiComponents, type ApiComponents} from '../apps/api/src/composition.js';
 import {runMigrations} from '../apps/api/src/migrations.js';
 import {createApiServer} from '../apps/api/src/server.js';
-import type {CommentPageResponse} from '../apps/api/src/comment-response.js';
+import type {CommentPageResponse, CommentResponse} from '../apps/api/src/comment-response.js';
 import type {HttpErrorEnvelope} from '../apps/api/src/http-error.js';
 import {
+    ok,
+    ReplyToComment,
     toAccountId,
     toCommentId,
     toExternalAuthorId,
     toExternalCommentId,
+    toIdempotencyKey,
     toPostId,
+    toSocialPlatform,
     type AccountId,
     type Comment,
+    type CommentId,
+    type IdempotencyKey,
+    type IndeterminatePlatformResultFailure,
     type NormalizedComment,
+    type PlatformComment,
+    type PlatformFailure,
     type PostId,
+    type PublishedReply,
+    type ReplyToPlatformCommentInput,
+    type Result,
+    type SocialCommentsGateway,
+    type SocialPlatform,
 } from '@threadbridge/comments';
 
 const databaseUrl = process.env.DATABASE_URL;
@@ -320,6 +335,395 @@ describe('imported comment entities', () => {
 
 const DEMO_POST_ID = '0198f000-0000-7000-8000-000000000002';
 
+const publishedReply = (
+    suffix: string,
+    parentCommentId: CommentId,
+    content: string,
+    idempotencyKey: IdempotencyKey,
+): PublishedReply => ({
+    postId: fixturePostId,
+    parentCommentId,
+    externalCommentId: toExternalCommentId(`integration-published-${suffix}`),
+    externalAuthorId: toExternalAuthorId('integration-author-self'),
+    content,
+    platformCreatedAt,
+    metadata: {source: 'integration'},
+    idempotencyKey,
+});
+
+describe('PostgresCommentRepository publication', () => {
+    it('returns null for an unused idempotency key', async () => {
+        const repository = new PostgresCommentRepository(sql);
+
+        expect(await repository.findByIdempotencyKey(toIdempotencyKey('unused-key'))).toBeNull();
+    });
+
+    it('persists a published reply with every field and a fresh identity', async () => {
+        const repository = new PostgresCommentRepository(sql);
+        const [parent] = await repository.saveMany([importedComment('publish-parent', null)]);
+
+        if (parent === undefined) {
+            throw new Error('The parent comment was not persisted.');
+        }
+
+        const key = toIdempotencyKey('integration-key-1');
+        const saved = await repository.savePublishedReply(
+            publishedReply('one', parent.id, 'A published reply', key),
+        );
+
+        expect(saved.kind).toBe('created');
+        expect(saved.comment.id).toMatch(
+            /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
+        );
+        expect(saved.comment.version).toBe(1);
+        expect(saved.comment.parentCommentId).toBe(parent.id);
+        expect(saved.comment.postId).toBe(fixturePostId);
+        expect(saved.comment.content).toBe('A published reply');
+        expect(saved.comment.idempotencyKey).toBe(key);
+        expect(saved.comment.metadata).toEqual({source: 'integration'});
+        expect(await repository.findByIdempotencyKey(key)).toEqual(saved.comment);
+    });
+
+    it('converges a repeated publication of the same key on one row', async () => {
+        const repository = new PostgresCommentRepository(sql);
+        const [parent] = await repository.saveMany([importedComment('publish-repeat', null)]);
+
+        if (parent === undefined) {
+            throw new Error('The parent comment was not persisted.');
+        }
+
+        const key = toIdempotencyKey('integration-key-2');
+        const reply = publishedReply('two', parent.id, 'Repeated', key);
+        const first = await repository.savePublishedReply(reply);
+        const second = await repository.savePublishedReply(reply);
+        const rows = await sql<IdRow[]>`
+            select id from comments where idempotency_key = ${key}
+        `;
+
+        expect(first.kind).toBe('created');
+        expect(second.kind).toBe('existing');
+        expect(second.comment.id).toBe(first.comment.id);
+        expect(rows).toHaveLength(1);
+    });
+
+    it('converges concurrent publications of the same key on one identity', async () => {
+        const repository = new PostgresCommentRepository(sql);
+        const [parent] = await repository.saveMany([importedComment('publish-race', null)]);
+
+        if (parent === undefined) {
+            throw new Error('The parent comment was not persisted.');
+        }
+
+        const key = toIdempotencyKey('integration-key-3');
+        const reply = publishedReply('three', parent.id, 'Concurrent', key);
+        const results = await Promise.all([
+            repository.savePublishedReply(reply),
+            repository.savePublishedReply(reply),
+            repository.savePublishedReply(reply),
+        ]);
+        const rows = await sql<IdRow[]>`
+            select id from comments where idempotency_key = ${key}
+        `;
+
+        expect(rows).toHaveLength(1);
+        expect(new Set(results.map((result): string => result.comment.id)).size).toBe(1);
+        expect(results.filter((result): boolean => result.kind === 'created')).toHaveLength(1);
+    });
+
+    it('converges concurrent publications of one key that returned different external ids',
+        async () => {
+            const repository = new PostgresCommentRepository(sql);
+            const [parent] = await repository.saveMany([importedComment('publish-diverge', null)]);
+
+            if (parent === undefined) {
+                throw new Error('The parent comment was not persisted.');
+            }
+
+            const key = toIdempotencyKey('integration-key-diverge');
+            const results = await Promise.all([
+                repository.savePublishedReply(
+                    publishedReply('diverge-a', parent.id, 'Diverging', key),
+                ),
+                repository.savePublishedReply(
+                    publishedReply('diverge-b', parent.id, 'Diverging', key),
+                ),
+                repository.savePublishedReply(
+                    publishedReply('diverge-c', parent.id, 'Diverging', key),
+                ),
+            ]);
+            const rows = await sql<IdRow[]>`
+                select id from comments where idempotency_key = ${key}
+            `;
+
+            expect(rows).toHaveLength(1);
+            expect(new Set(results.map((result): string => result.comment.id)).size).toBe(1);
+            expect(results.filter((result): boolean => result.kind === 'created')).toHaveLength(1);
+            expect(results.filter((result): boolean => result.kind === 'existing')).toHaveLength(2);
+        });
+
+    it('waits for a concurrent holder of the same key and adopts its row', async () => {
+        const repository = new PostgresCommentRepository(sql);
+        const [parent] = await repository.saveMany([importedComment('publish-lockstep', null)]);
+
+        if (parent === undefined) {
+            throw new Error('The parent comment was not persisted.');
+        }
+
+        const key = toIdempotencyKey('integration-key-lockstep');
+        let winnerId = '';
+
+        // Holds the advisory lock for this key, inserts a competing row under a different external
+        // identity, and commits only after the repository call is certainly blocked on the lock.
+        // Without the lock the repository would insert concurrently and hit the unique index.
+        const holder = sql.begin<string>(async (transaction): Promise<string> => {
+            await transaction`
+                select pg_advisory_xact_lock(hashtextextended(${key}::text, 0))
+            `;
+
+            const rows = await transaction<IdRow[]>`
+                insert into comments (
+                    post_id, parent_comment_id, external_comment_id, external_author_id,
+                    content, platform_created_at, idempotency_key
+                ) values (
+                    ${fixturePostId}, ${parent.id}, 'integration-lockstep-winner',
+                    'integration-author-self', 'Winner', ${platformCreatedAt}, ${key}
+                )
+                returning id
+            `;
+            const inserted = rows.at(0);
+
+            if (inserted === undefined) {
+                throw new Error('The competing row was not inserted.');
+            }
+
+            winnerId = inserted.id;
+            await setTimeout(150);
+
+            return inserted.id;
+        });
+
+        await setTimeout(50);
+        const saved = await repository.savePublishedReply(
+            publishedReply('lockstep-loser', parent.id, 'Loser', key),
+        );
+        await holder;
+
+        const rows = await sql<IdRow[]>`
+            select id from comments where idempotency_key = ${key}
+        `;
+
+        expect(saved.kind).toBe('existing');
+        expect(saved.comment.id).toBe(winnerId);
+        expect(saved.comment.content).toBe('Winner');
+        expect(rows).toHaveLength(1);
+    });
+
+    it('creates separate rows for different idempotency keys', async () => {
+        const repository = new PostgresCommentRepository(sql);
+        const [parent] = await repository.saveMany([importedComment('publish-distinct', null)]);
+
+        if (parent === undefined) {
+            throw new Error('The parent comment was not persisted.');
+        }
+
+        const first = await repository.savePublishedReply(
+            publishedReply('four', parent.id, 'First', toIdempotencyKey('integration-key-4')),
+        );
+        const second = await repository.savePublishedReply(
+            publishedReply('five', parent.id, 'Second', toIdempotencyKey('integration-key-5')),
+        );
+
+        expect(second.comment.id).not.toBe(first.comment.id);
+        expect(second.kind).toBe('created');
+    });
+
+    it('publishes a reply to a reply', async () => {
+        const repository = new PostgresCommentRepository(sql);
+        const [parent] = await repository.saveMany([importedComment('publish-depth', null)]);
+
+        if (parent === undefined) {
+            throw new Error('The parent comment was not persisted.');
+        }
+
+        const first = await repository.savePublishedReply(
+            publishedReply('depth-1', parent.id, 'Depth one', toIdempotencyKey('integration-key-6')),
+        );
+        const second = await repository.savePublishedReply(
+            publishedReply(
+                'depth-2',
+                first.comment.id,
+                'Depth two',
+                toIdempotencyKey('integration-key-7'),
+            ),
+        );
+
+        expect(second.comment.parentCommentId).toBe(first.comment.id);
+        expect(first.comment.parentCommentId).toBe(parent.id);
+    });
+
+    it('reconciles an already imported reply instead of duplicating it', async () => {
+        const repository = new PostgresCommentRepository(sql);
+        const [parent] = await repository.saveMany([importedComment('publish-import', null)]);
+
+        if (parent === undefined) {
+            throw new Error('The parent comment was not persisted.');
+        }
+
+        const key = toIdempotencyKey('integration-key-8');
+        const reply = publishedReply('imported', parent.id, 'Imported first', key);
+        const [imported] = await repository.saveMany([
+            {
+                postId: reply.postId,
+                parentCommentId: reply.parentCommentId,
+                externalCommentId: reply.externalCommentId,
+                externalAuthorId: reply.externalAuthorId,
+                content: reply.content,
+                platformCreatedAt: reply.platformCreatedAt,
+                metadata: reply.metadata,
+            },
+        ]);
+
+        const saved = await repository.savePublishedReply(reply);
+        const rows = await sql<IdRow[]>`
+            select id from comments
+            where post_id = ${fixturePostId}
+              and external_comment_id = ${reply.externalCommentId}
+        `;
+
+        expect(rows).toHaveLength(1);
+        expect(saved.kind).toBe('existing');
+        expect(saved.comment.id).toBe(imported?.id);
+        expect(saved.comment.createdAt).toEqual(imported?.createdAt);
+        expect(saved.comment.idempotencyKey).toBe(key);
+    });
+
+    it('never replaces an idempotency key that is already recorded', async () => {
+        const repository = new PostgresCommentRepository(sql);
+        const [parent] = await repository.saveMany([importedComment('publish-keep-key', null)]);
+
+        if (parent === undefined) {
+            throw new Error('The parent comment was not persisted.');
+        }
+
+        const original = toIdempotencyKey('integration-key-9');
+        const reply = publishedReply('keep', parent.id, 'Keep the key', original);
+        await repository.savePublishedReply(reply);
+
+        const saved = await repository.savePublishedReply({
+            ...reply,
+            idempotencyKey: toIdempotencyKey('integration-key-10'),
+        });
+
+        expect(saved.comment.idempotencyKey).toBe(original);
+        expect(await repository.findByIdempotencyKey(toIdempotencyKey('integration-key-10')))
+            .toBeNull();
+    });
+});
+
+/** Answers each publication with a distinct external comment id, as a real platform might. */
+class DivergingGateway implements SocialCommentsGateway {
+    private calls = 0;
+
+    public constructor(private readonly externalIdPrefix: string) {}
+
+    public getComments(): never {
+        throw new Error('This gateway only publishes.');
+    }
+
+    public getReplies(): never {
+        throw new Error('This gateway only publishes.');
+    }
+
+    public replyToComment(
+        input: ReplyToPlatformCommentInput,
+    ): Promise<Result<PlatformComment, PlatformFailure | IndeterminatePlatformResultFailure>> {
+        this.calls += 1;
+
+        return Promise.resolve(
+            ok<PlatformComment>({
+                externalCommentId: toExternalCommentId(
+                    `${this.externalIdPrefix}-${String(this.calls)}`,
+                ),
+                externalAuthorId: toExternalAuthorId('integration-author-self'),
+                content: input.content,
+                createdAt: platformCreatedAt,
+                metadata: null,
+            }),
+        );
+    }
+}
+
+describe('ReplyToComment against real PostgreSQL', () => {
+    it('resolves a same-key race as one row plus an idempotency conflict', async () => {
+        const comments = new PostgresCommentRepository(sql);
+        const contexts = new PostgresCommentReplyContextRepository(sql);
+        const [parent] = await comments.saveMany([importedComment('race-parent', null)]);
+
+        if (parent === undefined) {
+            throw new Error('The parent comment was not persisted.');
+        }
+
+        const platform = toSocialPlatform('demo');
+        const useCase = new ReplyToComment(
+            contexts,
+            new Map<SocialPlatform, SocialCommentsGateway>([
+                [platform, new DivergingGateway('integration-diverging-conflict')],
+            ]),
+            comments,
+        );
+        const key = toIdempotencyKey('integration-key-race');
+
+        const results = await Promise.all([
+            useCase.execute({parentCommentId: parent.id, content: 'First', idempotencyKey: key}),
+            useCase.execute({parentCommentId: parent.id, content: 'Second', idempotencyKey: key}),
+        ]);
+        const rows = await sql<IdRow[]>`
+            select id from comments where idempotency_key = ${key}
+        `;
+
+        expect(rows).toHaveLength(1);
+        expect(results.filter((result): boolean => result.ok)).toHaveLength(1);
+
+        const conflicts = results.filter(
+            (result): boolean => !result.ok && result.error.code === 'IDEMPOTENCY_CONFLICT',
+        );
+
+        expect(conflicts).toHaveLength(1);
+    });
+
+    it('replays an identical concurrent request instead of conflicting', async () => {
+        const comments = new PostgresCommentRepository(sql);
+        const contexts = new PostgresCommentReplyContextRepository(sql);
+        const [parent] = await comments.saveMany([importedComment('race-identical', null)]);
+
+        if (parent === undefined) {
+            throw new Error('The parent comment was not persisted.');
+        }
+
+        const platform = toSocialPlatform('demo');
+        const useCase = new ReplyToComment(
+            contexts,
+            new Map<SocialPlatform, SocialCommentsGateway>([
+                [platform, new DivergingGateway('integration-diverging-identical')],
+            ]),
+            comments,
+        );
+        const key = toIdempotencyKey('integration-key-race-same');
+        const request = {parentCommentId: parent.id, content: 'Same', idempotencyKey: key};
+
+        const results = await Promise.all([useCase.execute(request), useCase.execute(request)]);
+        const rows = await sql<IdRow[]>`
+            select id from comments where idempotency_key = ${key}
+        `;
+        const outcomes = results.map((result): string =>
+            result.ok ? result.value.comment.id : result.error.code);
+
+        expect(rows).toHaveLength(1);
+        expect(results.every((result): boolean => result.ok)).toBe(true);
+        expect(new Set(outcomes).size).toBe(1);
+    });
+});
+
 describe('retrieval REST endpoints', () => {
     let components: ApiComponents;
     let server: ReturnType<typeof createApiServer>;
@@ -458,5 +862,239 @@ describe('retrieval REST endpoints', () => {
         expect(response.status).toBe(404);
         expect(body.error.code).toBe('ROUTE_NOT_FOUND');
         expect(body.error.message).toBe('Route was not found');
+    });
+
+    it('does not match GET on the publication route', async () => {
+        const response = await fetch(`${baseUrl}/comments`);
+        const body = (await response.json()) as HttpErrorEnvelope;
+
+        expect(response.status).toBe(404);
+        expect(body.error.code).toBe('ROUTE_NOT_FOUND');
+    });
+
+    describe('publication', () => {
+        const publish = async (
+            body: string,
+            idempotencyKey: string | null,
+        ): Promise<Response> =>
+            await fetch(`${baseUrl}/comments`, {
+                method: 'POST',
+                headers: {
+                    'content-type': 'application/json',
+                    ...(idempotencyKey === null ? {} : {'idempotency-key': idempotencyKey}),
+                },
+                body,
+            });
+
+        const rootCommentId = async (): Promise<string> => {
+            const page = await readPage(`/posts/${DEMO_POST_ID}/comments`);
+            const parent = page.items.find(
+                (item): boolean => item.externalCommentId === 'demo-comment-1',
+            );
+
+            if (parent === undefined) {
+                throw new Error('The demo root comment was not returned.');
+            }
+
+            return parent.id;
+        };
+
+        it('creates a reply and returns 201 with the public comment shape', async () => {
+            const parentCommentId = await rootCommentId();
+            const response = await publish(
+                JSON.stringify({parentCommentId, content: 'Thank you for your comment'}),
+                'rest-key-1',
+            );
+            const body = (await response.json()) as CommentResponse;
+
+            expect(response.status).toBe(201);
+            expect(response.headers.get('content-type')).toBe('application/json; charset=utf-8');
+            expect(body.parentCommentId).toBe(parentCommentId);
+            expect(body.postId).toBe(DEMO_POST_ID);
+            expect(body.content).toBe('Thank you for your comment');
+            expect(Object.keys(body).sort()).toEqual([
+                'content',
+                'createdAt',
+                'externalAuthorId',
+                'externalCommentId',
+                'id',
+                'parentCommentId',
+                'platformCreatedAt',
+                'postId',
+                'updatedAt',
+            ]);
+        });
+
+        it('persists the created reply in PostgreSQL', async () => {
+            const parentCommentId = await rootCommentId();
+            const response = await publish(
+                JSON.stringify({parentCommentId, content: 'Persisted reply'}),
+                'rest-key-2',
+            );
+            const body = (await response.json()) as CommentResponse;
+            const rows = await sql<{content: string; idempotency_key: string | null}[]>`
+                select content, idempotency_key from comments where id = ${body.id}
+            `;
+
+            expect(rows.at(0)).toEqual({content: 'Persisted reply', idempotency_key: 'rest-key-2'});
+        });
+
+        it('replays an identical request with 200 and the same identifier', async () => {
+            const parentCommentId = await rootCommentId();
+            const body = JSON.stringify({parentCommentId, content: 'Replayed reply'});
+
+            const first = await publish(body, 'rest-key-3');
+            const created = (await first.json()) as CommentResponse;
+            const second = await publish(body, 'rest-key-3');
+            const replayed = (await second.json()) as CommentResponse;
+
+            expect(first.status).toBe(201);
+            expect(second.status).toBe(200);
+            expect(replayed.id).toBe(created.id);
+        });
+
+        it('reports a conflict when the same key carries different content', async () => {
+            const parentCommentId = await rootCommentId();
+
+            await publish(
+                JSON.stringify({parentCommentId, content: 'Original content'}),
+                'rest-key-4',
+            );
+            const response = await publish(
+                JSON.stringify({parentCommentId, content: 'Different content'}),
+                'rest-key-4',
+            );
+            const body = (await response.json()) as HttpErrorEnvelope;
+
+            expect(response.status).toBe(409);
+            expect(body.error.code).toBe('IDEMPOTENCY_CONFLICT');
+            expect(body.error.message).toBe('Idempotency key conflicts with an existing request');
+            expect(JSON.stringify(body)).not.toContain('rest-key-4');
+        });
+
+        it('reports a conflict when the same key targets a different parent', async () => {
+            const parentCommentId = await rootCommentId();
+            const page = await readPage(`/posts/${DEMO_POST_ID}/comments`);
+            const otherParent = page.items.find(
+                (item): boolean => item.externalCommentId === 'demo-comment-2',
+            );
+
+            if (otherParent === undefined) {
+                throw new Error('The second demo root comment was not returned.');
+            }
+
+            await publish(JSON.stringify({parentCommentId, content: 'Same content'}), 'rest-key-5');
+            const response = await publish(
+                JSON.stringify({parentCommentId: otherParent.id, content: 'Same content'}),
+                'rest-key-5',
+            );
+
+            expect(response.status).toBe(409);
+        });
+
+        it.each([
+            ['a missing idempotency key', '{"parentCommentId":"x","content":"y"}', null],
+            ['an empty idempotency key', '{"parentCommentId":"x","content":"y"}', '   '],
+            ['malformed JSON', '{not json', 'rest-key-invalid'],
+            ['a body that is not an object', '["array"]', 'rest-key-invalid'],
+            ['a missing parent', '{"content":"y"}', 'rest-key-invalid'],
+            ['a malformed parent uuid', '{"parentCommentId":"nope","content":"y"}', 'rest-key-invalid'],
+            [
+                'missing content',
+                '{"parentCommentId":"0198f000-0000-7000-8000-0000000000aa"}',
+                'rest-key-invalid',
+            ],
+            [
+                'blank content',
+                '{"parentCommentId":"0198f000-0000-7000-8000-0000000000aa","content":"   "}',
+                'rest-key-invalid',
+            ],
+            [
+                'non-string content',
+                '{"parentCommentId":"0198f000-0000-7000-8000-0000000000aa","content":42}',
+                'rest-key-invalid',
+            ],
+        ])('rejects %s with a validation error', async (
+            _name: string,
+            body: string,
+            idempotencyKey: string | null,
+        ) => {
+            const response = await publish(body, idempotencyKey);
+            const envelope = (await response.json()) as HttpErrorEnvelope;
+
+            expect(response.status).toBe(400);
+            expect(envelope.error.code).toBe('VALIDATION_ERROR');
+            expect(envelope.error.message).toBe('Request validation failed');
+            expect(envelope.error.requestId.length).toBeGreaterThan(0);
+        });
+
+        it('reports an unknown parent comment as not found', async () => {
+            const response = await publish(
+                JSON.stringify({
+                    parentCommentId: '0198f000-0000-7000-8000-0000000000ac',
+                    content: 'Orphan reply',
+                }),
+                'rest-key-6',
+            );
+            const body = (await response.json()) as HttpErrorEnvelope;
+
+            expect(response.status).toBe(404);
+            expect(body.error.code).toBe('COMMENT_NOT_FOUND');
+        });
+
+        it('publishes a reply to a reply and exposes it through the replies endpoint', async () => {
+            const parentCommentId = await rootCommentId();
+            const first = await publish(
+                JSON.stringify({parentCommentId, content: 'Depth one'}),
+                'rest-key-7',
+            );
+            const created = (await first.json()) as CommentResponse;
+
+            const second = await publish(
+                JSON.stringify({parentCommentId: created.id, content: 'Depth two'}),
+                'rest-key-8',
+            );
+            const deeper = (await second.json()) as CommentResponse;
+            const replies = await readPage(`/comments/${created.id}/replies`);
+
+            expect(second.status).toBe(201);
+            expect(deeper.parentCommentId).toBe(created.id);
+            expect(replies.items.map((item): string => item.id)).toContain(deeper.id);
+        });
+
+        it('maps a platform rate limit to 429 and an indeterminate result to 502', async () => {
+            const imported = await sql<IdRow[]>`
+                insert into comments (
+                    post_id, external_comment_id, external_author_id, content, platform_created_at
+                ) values
+                    (${DEMO_POST_ID}, 'demo-rate-limited', 'demo-author', 'x', now()),
+                    (${DEMO_POST_ID}, 'demo-indeterminate', 'demo-author', 'y', now())
+                on conflict (post_id, external_comment_id) do update set updated_at = now()
+                returning id
+            `;
+            const [rateLimited, indeterminate] = [imported.at(0), imported.at(1)];
+
+            if (rateLimited === undefined || indeterminate === undefined) {
+                throw new Error('The failure-trigger comments were not persisted.');
+            }
+
+            const limited = await publish(
+                JSON.stringify({parentCommentId: rateLimited.id, content: 'Rate limited'}),
+                'rest-key-9',
+            );
+            const unknown = await publish(
+                JSON.stringify({parentCommentId: indeterminate.id, content: 'Unknown outcome'}),
+                'rest-key-10',
+            );
+            const unknownBody = (await unknown.json()) as HttpErrorEnvelope;
+            const stored = await sql<IdRow[]>`
+                select id from comments where idempotency_key in ('rest-key-9', 'rest-key-10')
+            `;
+
+            expect(limited.status).toBe(429);
+            expect(unknown.status).toBe(502);
+            expect(unknownBody.error.code).toBe('INDETERMINATE_PLATFORM_RESULT');
+            expect(stored).toEqual([]);
+        });
     });
 });

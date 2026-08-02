@@ -250,7 +250,9 @@ interface CommentRepository {
     getReplies(input: GetRepliesQuery): Promise<CommentPage>;
     findById(id: CommentId): Promise<Comment | null>;
     findByIdempotencyKey(key: IdempotencyKey): Promise<Comment | null>;
-    save(comment: Comment): Promise<void>;
+    savePublishedReply(
+        reply: PublishedReply,
+    ): Promise<SavePublishedReplyResult>;
     saveMany(
         comments: readonly NormalizedComment[],
     ): Promise<readonly Comment[]>;
@@ -263,17 +265,22 @@ interface SocialCommentsGateway {
     getReplies(
         input: GetPlatformRepliesInput,
     ): Promise<Result<PlatformCommentPage, PlatformFailure>>;
-    replyToComment(input: ReplyToPlatformCommentInput): Promise<PlatformComment>;
-}
-
-interface TransactionManager {
-    run<T>(operation: () => Promise<T>): Promise<T>;
+    replyToComment(
+        input: ReplyToPlatformCommentInput,
+    ): Promise<Result<
+        PlatformComment,
+        PlatformFailure | IndeterminatePlatformResultFailure
+    >>;
 }
 ```
 
 Internal identity, optimistic-locking versions, and local timestamps are owned by the store. A persistence operation that assigns or preserves internal identity therefore returns the persisted entities rather than `void`, so the caller reports the same state that was stored.
 
 Platform gateways report expected failures as typed results rather than exceptions, so the application handles every declared failure mode exhaustively.
+
+A publication operation reports whether it created a row or converged on one an earlier request had already stored, so the transport can answer `201 Created` or `200 OK` without inspecting persistence details.
+
+The implemented writes are single atomic statements owned by their adapter: importing a page upserts on external identity, and publishing a reply upserts once after the platform has already answered. No application-visible transaction manager exists, because no use case composes two writes that must succeed or fail together. One is introduced only when behavior requires it.
 
 A platform registry may be represented by a typed read-only map. A dedicated registry class is unnecessary until registry-specific behavior appears.
 

@@ -3,15 +3,23 @@ import {
     toCursor,
     toExternalAuthorId,
     toExternalCommentId,
+    toSocialPlatform,
     type Cursor,
     type GetPlatformCommentsInput,
     type GetPlatformRepliesInput,
+    type IndeterminatePlatformResultFailure,
     type PlatformComment,
     type PlatformCommentPage,
     type PlatformFailure,
+    type ReplyToPlatformCommentInput,
     type Result,
     type SocialCommentsGateway,
 } from '@threadbridge/comments';
+
+const DEMO_PLATFORM = toSocialPlatform('demo');
+
+/** Publishing against this parent reports an unknown outcome instead of a success or a failure. */
+const INDETERMINATE_TRIGGER = 'demo-indeterminate';
 
 const PAGE_SIZE = 2;
 
@@ -74,7 +82,7 @@ const decodeOffset = (cursor: Cursor | null): number | null => {
 
 const pageOf = (
     externalId: string,
-    source: ReadonlyMap<string, readonly PlatformComment[]>,
+    items: readonly PlatformComment[],
     cursor: Cursor | null,
 ): Result<PlatformCommentPage, PlatformFailure> => {
     const failure = failures.get(externalId);
@@ -89,7 +97,6 @@ const pageOf = (
         return ok<PlatformCommentPage>({items: [], nextCursor: null});
     }
 
-    const items = source.get(externalId) ?? [];
     const nextOffset = offset + PAGE_SIZE;
 
     return ok<PlatformCommentPage>({
@@ -104,15 +111,74 @@ const pageOf = (
  * platform.
  */
 export class DemoSocialCommentsGateway implements SocialCommentsGateway {
+    /** Replies published through this adapter instance, keyed by idempotency key. */
+    private readonly publishedByKey = new Map<string, PlatformComment>();
+
+    /** The same replies, keyed by external parent comment id, so getReplies can return them. */
+    private readonly publishedByParent = new Map<string, PlatformComment[]>();
+
     public getComments(
         input: GetPlatformCommentsInput,
     ): Promise<Result<PlatformCommentPage, PlatformFailure>> {
-        return Promise.resolve(pageOf(input.externalPostId, rootComments, input.cursor));
+        return Promise.resolve(
+            pageOf(input.externalPostId, rootComments.get(input.externalPostId) ?? [], input.cursor),
+        );
     }
 
     public getReplies(
         input: GetPlatformRepliesInput,
     ): Promise<Result<PlatformCommentPage, PlatformFailure>> {
-        return Promise.resolve(pageOf(input.externalParentCommentId, replies, input.cursor));
+        const parent = input.externalParentCommentId;
+        const items = [
+            ...(replies.get(parent) ?? []),
+            ...(this.publishedByParent.get(parent) ?? []),
+        ];
+
+        return Promise.resolve(pageOf(parent, items, input.cursor));
+    }
+
+    /**
+     * Publishing is idempotent on the platform side: a key that was already used returns the reply
+     * it originally created, even when the new input differs. The application detects that
+     * mismatch from its own persisted request data.
+     */
+    public replyToComment(
+        input: ReplyToPlatformCommentInput,
+    ): Promise<Result<PlatformComment, PlatformFailure | IndeterminatePlatformResultFailure>> {
+        const parent = input.externalParentCommentId;
+        const failure = failures.get(parent);
+
+        if (failure !== undefined) {
+            return Promise.resolve({ok: false, error: failure});
+        }
+
+        if (parent === INDETERMINATE_TRIGGER) {
+            return Promise.resolve({
+                ok: false,
+                error: {code: 'INDETERMINATE_PLATFORM_RESULT', platform: DEMO_PLATFORM},
+            });
+        }
+
+        const alreadyPublished = this.publishedByKey.get(input.idempotencyKey);
+
+        if (alreadyPublished !== undefined) {
+            return Promise.resolve(ok<PlatformComment>(alreadyPublished));
+        }
+
+        const published: PlatformComment = {
+            externalCommentId: toExternalCommentId(`demo-published-${input.idempotencyKey}`),
+            externalAuthorId: toExternalAuthorId('demo-author-self'),
+            content: input.content,
+            createdAt: new Date('2026-01-03T00:00:00.000Z'),
+            metadata: {source: 'demo', published: true},
+        };
+
+        this.publishedByKey.set(input.idempotencyKey, published);
+        this.publishedByParent.set(parent, [
+            ...(this.publishedByParent.get(parent) ?? []),
+            published,
+        ]);
+
+        return Promise.resolve(ok<PlatformComment>(published));
     }
 }

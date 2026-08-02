@@ -1,4 +1,4 @@
-import type {CommentId, PostId, SocialPlatform} from './identifiers.js';
+import type {CommentId, IdempotencyKey, PostId, SocialPlatform} from './identifiers.js';
 
 /**
  * Failures a social-platform adapter translates external errors into. They carry the discriminant
@@ -25,6 +25,20 @@ export interface UnsupportedPlatformFailure {
     readonly platform: SocialPlatform;
 }
 
+export interface IdempotencyConflictFailure {
+    readonly code: 'IDEMPOTENCY_CONFLICT';
+    readonly idempotencyKey: IdempotencyKey;
+}
+
+/**
+ * The external call may have succeeded, but its result is unknown. The current implementation
+ * never retries automatically, because the platform does not guarantee idempotency.
+ */
+export interface IndeterminatePlatformResultFailure {
+    readonly code: 'INDETERMINATE_PLATFORM_RESULT';
+    readonly platform: SocialPlatform;
+}
+
 /**
  * Every failure the implemented comments use cases can produce. Failures are machine-readable: the
  * client-facing message of each code is chosen by the transport layer, never by the core.
@@ -33,4 +47,6 @@ export type CommentsFailure =
     | CommentNotFoundFailure
     | PostNotFoundFailure
     | UnsupportedPlatformFailure
+    | IdempotencyConflictFailure
+    | IndeterminatePlatformResultFailure
     | PlatformFailure;

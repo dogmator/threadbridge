@@ -21,7 +21,7 @@ export interface CommentPageResponse {
     readonly nextCursor: string | null;
 }
 
-const toCommentResponse = (comment: Comment): CommentResponse => ({
+export const toCommentResponse = (comment: Comment): CommentResponse => ({
     id: comment.id,
     postId: comment.postId,
     parentCommentId: comment.parentCommentId,

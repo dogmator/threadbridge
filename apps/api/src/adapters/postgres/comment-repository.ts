@@ -6,8 +6,11 @@ import {
     toPostId,
     type Comment,
     type CommentRepository,
+    type IdempotencyKey,
     type NormalizedComment,
     type PlatformMetadata,
+    type PublishedReply,
+    type SavePublishedReplyResult,
 } from '@threadbridge/comments';
 import type {Sql} from 'postgres';
 
@@ -104,5 +107,105 @@ export class PostgresCommentRepository implements CommentRepository {
 
             return stored;
         });
+    }
+
+    public async findByIdempotencyKey(idempotencyKey: IdempotencyKey): Promise<Comment | null> {
+        const rows = await this.sql<CommentRow[]>`
+            select * from comments where idempotency_key = ${idempotencyKey}
+        `;
+        const row = rows.at(0);
+
+        return row === undefined ? null : toComment(row);
+    }
+
+    /**
+     * A short transaction, opened only after the platform call has already returned.
+     *
+     * Publications sharing an idempotency key are serialized by a transaction-scoped advisory lock
+     * derived from that key, so the key is claimed exactly once even when the platform answers two
+     * concurrent requests with different external comment identifiers. A hash collision merely
+     * serializes unrelated keys; it cannot affect the outcome. Whoever loses the race re-reads the
+     * winning row and reports it as existing, which keeps a unique-constraint violation from ever
+     * reaching the caller.
+     */
+    public async savePublishedReply(reply: PublishedReply): Promise<SavePublishedReplyResult> {
+        const metadata = reply.metadata === null ? null : JSON.stringify(reply.metadata);
+
+        return await this.sql.begin<SavePublishedReplyResult>(
+            async (transaction): Promise<SavePublishedReplyResult> => {
+                await transaction`
+                    select pg_advisory_xact_lock(
+                        hashtextextended(${reply.idempotencyKey}::text, 0)
+                    )
+                `;
+
+                const claimed = await transaction<CommentRow[]>`
+                    select * from comments where idempotency_key = ${reply.idempotencyKey}
+                `;
+                const alreadyPublished = claimed.at(0);
+
+                if (alreadyPublished !== undefined) {
+                    return {kind: 'existing', comment: toComment(alreadyPublished)};
+                }
+
+                const inserted = await transaction<CommentRow[]>`
+                    insert into comments (
+                        post_id,
+                        parent_comment_id,
+                        external_comment_id,
+                        external_author_id,
+                        content,
+                        platform_created_at,
+                        platform_data,
+                        idempotency_key
+                    ) values (
+                        ${reply.postId},
+                        ${reply.parentCommentId},
+                        ${reply.externalCommentId},
+                        ${reply.externalAuthorId},
+                        ${reply.content},
+                        ${reply.platformCreatedAt},
+                        ${metadata}::text::jsonb,
+                        ${reply.idempotencyKey}
+                    )
+                    on conflict (post_id, external_comment_id) do nothing
+                    returning *
+                `;
+                const created = inserted.at(0);
+
+                if (created !== undefined) {
+                    return {kind: 'created', comment: toComment(created)};
+                }
+
+                // The same platform comment was already projected locally. Adopt the key only when
+                // the row carries none: a different recorded key is never replaced.
+                const reconciled = await transaction<CommentRow[]>`
+                    update comments
+                    set idempotency_key = ${reply.idempotencyKey}, updated_at = now()
+                    where post_id = ${reply.postId}
+                      and external_comment_id = ${reply.externalCommentId}
+                      and idempotency_key is null
+                    returning *
+                `;
+                const attached = reconciled.at(0);
+
+                if (attached !== undefined) {
+                    return {kind: 'existing', comment: toComment(attached)};
+                }
+
+                const current = await transaction<CommentRow[]>`
+                    select * from comments
+                    where post_id = ${reply.postId}
+                      and external_comment_id = ${reply.externalCommentId}
+                `;
+                const existing = current.at(0);
+
+                if (existing === undefined) {
+                    throw new Error('Publishing a reply neither inserted nor found a row.');
+                }
+
+                return {kind: 'existing', comment: toComment(existing)};
+            },
+        );
     }
 }
