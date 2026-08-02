@@ -1,7 +1,40 @@
+import {randomUUID} from 'node:crypto';
 import {once} from 'node:events';
 import {describe, expect, it} from 'vitest';
 import type {HttpErrorEnvelope} from '../apps/api/src/http-error.js';
 import {createApiServer, type ApiServerDependencies} from '../apps/api/src/server.js';
+import {
+    GetCommentReplies,
+    GetPostComments,
+    type Comment,
+    type CommentReplyContext,
+    type CommentReplyContextRepository,
+    type CommentRepository,
+    type PublishedPostContext,
+    type PublishedPostRepository,
+    type SocialCommentsGateway,
+    type SocialPlatform,
+} from '@threadbridge/comments';
+
+const noGateways = new Map<SocialPlatform, SocialCommentsGateway>();
+
+const noPosts: PublishedPostRepository = {
+    findContextByPostId: (): Promise<PublishedPostContext | null> => Promise.resolve(null),
+};
+
+const noReplyContexts: CommentReplyContextRepository = {
+    findByCommentId: (): Promise<CommentReplyContext | null> => Promise.resolve(null),
+};
+
+const noComments: CommentRepository = {
+    saveMany: (): Promise<readonly Comment[]> => Promise.resolve([]),
+};
+
+const dependenciesWith = (requestIdFactory: () => string): ApiServerDependencies => ({
+    requestIdFactory,
+    getPostComments: new GetPostComments(noPosts, noGateways, noComments),
+    getCommentReplies: new GetCommentReplies(noReplyContexts, noGateways, noComments),
+});
 
 class CountingRequestIdFactory {
     public calls = 0;
@@ -17,9 +50,9 @@ class CountingRequestIdFactory {
 
 const withApiServer = async (
     use: (baseUrl: string) => Promise<void>,
-    dependencies?: ApiServerDependencies,
+    requestIdFactory: () => string = randomUUID,
 ): Promise<void> => {
-    const server = dependencies === undefined ? createApiServer() : createApiServer(dependencies);
+    const server = createApiServer(dependenciesWith(requestIdFactory));
 
     server.listen(0, '127.0.0.1');
     await once(server, 'listening');
@@ -72,7 +105,7 @@ describe('API server', () => {
             async (baseUrl): Promise<void> => {
                 await fetch(`${baseUrl}/health`);
             },
-            {requestIdFactory: requestIds.create},
+            requestIds.create,
         );
 
         expect(requestIds.calls).toBe(0);
@@ -110,7 +143,7 @@ describe('API server', () => {
                     },
                 });
             },
-            {requestIdFactory: requestIds.create},
+            requestIds.create,
         );
     });
 
@@ -121,13 +154,13 @@ describe('API server', () => {
             async (baseUrl): Promise<void> => {
                 await fetch(`${baseUrl}/unknown`);
             },
-            {requestIdFactory: requestIds.create},
+            requestIds.create,
         );
 
         expect(requestIds.calls).toBe(1);
     });
 
-    it('generates a non-empty request identifier by default', async () => {
+    it('generates a non-empty request identifier with the production factory', async () => {
         await withApiServer(async (baseUrl): Promise<void> => {
             const response = await fetch(`${baseUrl}/unknown`);
             const body = (await response.json()) as HttpErrorEnvelope;

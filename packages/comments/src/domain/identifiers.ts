@@ -33,6 +33,8 @@ export const toExternalCommentId = (value: string): ExternalCommentId =>
 
 export const toExternalAuthorId = (value: string): ExternalAuthorId => value as ExternalAuthorId;
 
+export const toIdempotencyKey = (value: string): IdempotencyKey => value as IdempotencyKey;
+
 export const toSocialPlatform = (value: string): SocialPlatform => value as SocialPlatform;
 
 export const toCursor = (value: string): Cursor => value as Cursor;

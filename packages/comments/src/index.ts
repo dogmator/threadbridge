@@ -24,6 +24,7 @@ export {
     toExternalAuthorId,
     toExternalCommentId,
     toExternalPostId,
+    toIdempotencyKey,
     toPostId,
     toSocialPlatform,
 } from './domain/identifiers.js';

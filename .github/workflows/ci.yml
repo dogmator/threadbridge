@@ -11,6 +11,24 @@ jobs:
   check:
     runs-on: ubuntu-latest
 
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_DB: threadbridge
+          POSTGRES_USER: threadbridge
+          POSTGRES_PASSWORD: threadbridge
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U threadbridge -d threadbridge"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql://threadbridge:threadbridge@localhost:5432/threadbridge
+
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
