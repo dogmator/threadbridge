@@ -37,7 +37,7 @@ info:
     The HTTP layer bounds untrusted input before any use case runs: request bodies are limited to
     64 KiB measured in received bytes, an `Idempotency-Key` to 200 characters after trimming, reply
     content to 10,000 characters, and a cursor to 4,096 characters. Content is measured but never
-    normalized or rewritten; the exact accepted bytes are what gets published and later compared.
+    normalized or rewritten; the exact accepted string is what gets published and later compared.
   license:
     name: MIT
     identifier: MIT
@@ -293,10 +293,10 @@ components:
       description: |
         Opaque continuation token taken from the `nextCursor` of a previous page. It is never
         interpreted, decoded, or rewritten by the API and must be sent back exactly as received.
-        Omit it to request the first page.
+        Omit it or send an empty value to request the first page. Clients should only send cursors
+        returned by the API; behavior of arbitrary non-empty values is adapter-specific.
       schema:
         type: string
-        minLength: 1
         maxLength: 4096
 
     IdempotencyKey:
@@ -326,7 +326,9 @@ components:
 
     PublishReplyRequest:
       type: object
-      additionalProperties: false
+      description: |
+        Only the declared properties are read. An unknown property is ignored rather than rejected,
+        so the request schema stays open.
       required: [parentCommentId, content]
       properties:
         parentCommentId:

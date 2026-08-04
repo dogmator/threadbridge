@@ -22,6 +22,45 @@ explicit Hexagonal Architecture with PostgreSQL projection storage and social-pl
 - Cursor-based retrieval and idempotent reply publication through a provider registry.
 - Typed failures, checksum-verified serialized migrations, bounded HTTP input, and graceful shutdown.
 
+## Capability guide
+
+This compact map links ThreadBridge's implemented capabilities and project documentation to the
+relevant code and tests.
+
+| Capability or project material | Implementation | Tests |
+| --- | --- | --- |
+| Retrieve comments for a published post | `GET /posts/:postId/comments` → `GetPostComments` in `packages/comments/src/application/get-post-comments.ts` | `tests/get-post-comments.test.ts`, retrieval REST tests in `tests/integration.test.ts` |
+| Reply to a comment | `POST /comments` → `ReplyToComment` in `packages/comments/src/application/reply-to-comment.ts` | `tests/reply-to-comment.test.ts`, publication REST tests in `tests/integration.test.ts` |
+| Support multiple social platforms | The `SocialCommentsGateway` port and the platform registry in `apps/api/src/composition.ts`; use cases resolve a gateway by platform and never branch on a platform name | `tests/demo-gateway.test.ts` (a second registered gateway is routed to without touching application code), unsupported-platform cases in `tests/get-post-comments.test.ts` and `tests/get-comment-replies.test.ts` |
+| Expose the functionality through a REST API | `apps/api/src/server.ts` and `apps/api/src/router.ts` | `tests/server.test.ts`, `tests/http-limits.test.ts`, `tests/integration.test.ts` |
+| Database schema | `db/migrations/*.sql` defines `accounts`, `posts`, and `comments`; `apps/api/src/migrations.ts` maintains `schema_migrations` | `tests/migrations.test.ts`, schema and repository tests in `tests/integration.test.ts` |
+| API design | [`docs/openapi.yaml`](./docs/openapi.yaml) and [API at a glance](#api-at-a-glance) | REST integration tests plus `tests/http-error.test.ts` cover the response mappings |
+| Relevant TypeScript code | Strict TypeScript workspace under `apps/` and `packages/`, gated by `npm run check` | The whole suite runs inside the same gate |
+| Major design decisions | [`docs/architecture.md`](./docs/architecture.md) and [`SPECIFICATION.md`](./SPECIFICATION.md) | — |
+| Assumptions | [Assumptions and trade-offs](#assumptions-and-trade-offs) and `SPECIFICATION.md` | — |
+| AI-usage disclosure | [AI-assisted development](#ai-assisted-development) | — |
+
+### Supporting another platform
+
+Add a platform by:
+
+1. implementing `SocialCommentsGateway`;
+2. translating that provider's DTOs, cursors, and failures entirely inside the adapter; and
+3. registering the adapter in the composition-root gateway map.
+
+For example:
+
+```ts
+const gateways = new Map<SocialPlatform, SocialCommentsGateway>([
+    [toSocialPlatform('demo'), new DemoSocialCommentsGateway()],
+    [toSocialPlatform('another-platform'), new AnotherPlatformCommentsGateway(credentials)],
+]);
+```
+
+A post inherits its platform from the referenced `accounts` row, so requests are routed by data
+rather than platform-specific application branches. Application use cases do not branch on platform names. A platform with no registered
+gateway is reported as `UNSUPPORTED_PLATFORM`.
+
 ## Architecture
 
 ```mermaid
@@ -108,7 +147,8 @@ reply returns `201`, an identical replay returns `200`, and conflicting reuse of
 ## Quick start
 
 Docker Compose is the primary local workflow. A clean stack seeds one stable demo post:
-`0198f000-0000-7000-8000-000000000002`.
+`0198f000-0000-7000-8000-000000000002`. The stack publishes ports `3000` and `5432`; if either is
+already taken, override `API_PORT` or `POSTGRES_PORT` as shown in [`.env.example`](./.env.example).
 
 ```bash
 docker compose up --build -d
@@ -185,6 +225,42 @@ All API errors use one envelope:
 }
 ```
 
+## Assumptions and trade-offs
+
+These are ThreadBridge project design decisions and the reasoning behind them.
+
+| Decision | Why | Trade-off accepted |
+| --- | --- | --- |
+| PostgreSQL holds a normalized projection; the platform stays the source of truth | Comments must be addressable by internal identifiers and joinable to accounts and posts, and a reply needs a durable idempotency record | The projection can lag the platform; retrieval always asks the platform rather than reading the projection back |
+| UUID v7 for identifiers generated here | Time-ordered keys keep index locality without exposing a sequence, and PostgreSQL 18 generates them natively | Ties the schema to PostgreSQL 18 or an equivalent generator |
+| Opaque cursor pagination | The comment volume of a real post is unbounded, and a cursor can carry a platform continuation token that an offset cannot | Clients cannot jump to an arbitrary page |
+| `Idempotency-Key` on `POST /comments` | A reply is an external side effect; a retried request must not create a second one | Only the local half is guaranteed here — see [Idempotency and consistency](#idempotency-and-consistency) |
+| Reply as a comment row with `parent_comment_id` | A reply is a comment, and depth stays unrestricted without a second table | Retrieving a whole subtree would need recursion that this API deliberately does not offer |
+| Direct-reply retrieval as its own endpoint | A thread needs a way to walk one level down | One more route than root-comment retrieval alone |
+| A `version` column and its verified compare-and-set behavior | Editing is out of scope now, but the projection is the row a future edit would race on | Currently exercised by an integration test rather than a use case |
+| Migration checksums and an advisory lock | Silent drift of an applied migration is worse than a refusal to start, and several instances may start together | A deliberately edited migration requires a new file rather than an edit |
+| Transport request limits | The HTTP surface is public, so request bodies and selected fields are bounded before use cases run | Fixed limits rather than configurable, provider-specific limits |
+| Graceful shutdown | The process runs in a container that receives `SIGTERM`/`SIGINT`, so it stops accepting work and gives active requests a bounded grace period | The grace period is fixed and remaining connections are force-closed after it |
+| A deterministic in-memory demo adapter as the only platform | It proves the port end to end without credentials, network access, or a review-time API key | It forgets published replies on restart; a real adapter would not |
+| Node's built-in HTTP server, no framework | The routing surface is four routes; a framework would add dependencies without removing code | Routing and parsing are written explicitly |
+| Only one external runtime dependency: `postgres` | Fewer dependencies mean less to audit and less to keep current | No ORM, no validation library, no logger |
+
+## Production considerations
+
+These are deliberate scope boundaries, not additional requirements.
+
+- A real provider integration needs credentials, authentication, provider-specific cursor handling,
+  and explicit external-call deadlines; the demo adapter intentionally needs none of these.
+- Observability is limited to typed errors and request identifiers. Production needs structured logs,
+  metrics, and traces correlated by that identifier.
+- Provider-side idempotency differs by platform. Where an external write is indeterminate, a later
+  reconciliation process may be appropriate; this service surfaces the indeterminate result and
+  does not retry it automatically.
+- Larger pages may need persistence batching rather than the current simple row-at-a-time projection
+  writes.
+- The Compose image targets local/demo use. Deployment would need separate migration execution,
+  production process packaging, and capacity planning with autoscaling where applicable.
+
 ## Development and quality checks
 
 Requirements: Node.js `24.15.0`, npm `11.12.1`, and Docker with Compose support.
@@ -200,8 +276,11 @@ docker compose run --rm \
 ```
 
 It runs strict TypeScript checking, type-aware ESLint, and Vitest including PostgreSQL and REST
-integration tests. The same gate is used by CI and the versioned pre-commit hook. To enable that
-hook after cloning:
+integration tests. The tests own their fixtures and clean up after themselves, which includes the
+projected comments of the demo post, so running the gate against a database a demo stack is also
+using resets that projection; the next retrieval request rebuilds it.
+
+The same gate is used by CI and the versioned pre-commit hook. To enable that hook after cloning:
 
 ```bash
 git config core.hooksPath .githooks
@@ -214,25 +293,22 @@ apps/api/             HTTP API, composition root, and adapters
 packages/comments/    Domain model, ports, and application use cases
 db/migrations/        Versioned SQL schema and demo seed migrations
 tests/                Unit, contract, migration, repository, and REST tests
-docs/                 Architecture notes
+docs/                 Architecture notes and the OpenAPI contract
 Dockerfile            Local/demo API image
 compose.yaml          Local API and PostgreSQL stack
-SPECIFICATION.md      Behavioral and architectural source of truth
+SPECIFICATION.md      Behavioral and architectural contract
 ```
 
-## Production limitations
+## AI-assisted development
 
-These are deliberate scope boundaries:
-
-- Only the deterministic demo platform adapter exists; it keeps provider replies in memory.
-- Docker Compose and the current image target local/demo usage, not deployment.
-- Authentication, authorization, and production credential management are out of scope.
-- Provider-side idempotency is required to prevent duplicate external effects.
-- Workers, Transactional Outbox, reconciliation, polling, and automatic retry are not implemented.
+AI tools assisted with architectural review, test design, implementation feedback, and
+documentation refinement. All generated output was reviewed, adapted, and validated by the
+project author, who owns the final design and code.
 
 ## Documentation
 
-- [Specification](./SPECIFICATION.md) — behavioral and architectural source of truth.
+- [Specification](./SPECIFICATION.md) — ThreadBridge's behavioral and architectural contract,
+  including its project assumptions and design decisions.
 - [Architecture notes](./docs/architecture.md) — boundaries, migrations, consistency, and shutdown.
 - [OpenAPI specification](./docs/openapi.yaml) — machine-readable HTTP contract.
 - [CI workflow](./.github/workflows/ci.yml) — the repository quality gate.

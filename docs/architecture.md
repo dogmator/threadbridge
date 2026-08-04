@@ -17,7 +17,10 @@ Domain model and ports
 PostgreSQL and social-platform adapters
 ```
 
-[`SPECIFICATION.md`](../SPECIFICATION.md) is the source of truth for required behavior, assumptions, and non-goals. This document explains the intended implementation boundaries without redefining that contract.
+[`SPECIFICATION.md`](../SPECIFICATION.md) is ThreadBridge's behavioral and architectural contract:
+it records the behavior the service commits to, project assumptions, design decisions, and
+non-goals. This document explains the intended implementation boundaries without redefining that
+contract.
 
 ## HTTP API
 
