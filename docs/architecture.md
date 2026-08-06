@@ -60,6 +60,18 @@ Application use cases coordinate the required behavior:
 
 Application code depends on domain types and ports rather than concrete PostgreSQL or social-platform adapters. External platform calls must not be held inside database transactions.
 
+### Deployment boundary and asynchronous evolution
+
+ThreadBridge is one application deployable unit. The HTTP server, application use cases, provider
+adapters, PostgreSQL adapters, and any first scheduled or background change-tracking coordinator
+run in the same application container. PostgreSQL remains a separate infrastructure service.
+
+A future non-HTTP entry point must call the same application use cases or narrow ports as HTTP,
+persist durable cursors or checkpoints in PostgreSQL, and keep provider calls outside database
+transactions. Splitting execution into a separate process or container is a later deployment
+decision; no worker, broker, outbox, or scheduler abstraction is introduced before concrete behavior
+requires it.
+
 ## Domain and ports
 
 The domain defines normalized comment data, typed identifiers, results, errors, and the contracts required by the application layer.
