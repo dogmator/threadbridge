@@ -94,6 +94,7 @@ PostgreSQL and social-platform adapters
 - Concrete dependencies are assembled in a composition root.
 - Application code must not branch on concrete platform names.
 - Adding a platform requires a new `SocialCommentsGateway` implementation and registration.
+- Each gateway must declare the operations and publication-idempotency guarantee it supports.
 - External platform calls must never execute inside a PostgreSQL transaction.
 - Abstractions are introduced only when supported by current behavior.
 - Simple duplication is preferable to a premature generic abstraction.
@@ -307,7 +308,15 @@ interface CommentReplyContextRepository {
     ): Promise<CommentReplyContext | null>;
 }
 
+interface SocialCommentsCapabilities {
+    readonly rootComments: boolean;
+    readonly directReplies: boolean;
+    readonly replyPublication: boolean;
+    readonly publicationIdempotency: 'native' | 'none';
+}
+
 interface SocialCommentsGateway {
+    readonly capabilities: SocialCommentsCapabilities;
     getComments(
         input: GetPlatformCommentsInput,
     ): Promise<Result<PlatformCommentPage, PlatformFailure>>;
@@ -485,6 +494,9 @@ Required scenarios:
 - rejecting different input with an already used idempotency key;
 - translating platform errors;
 - preserving cursor pagination;
+- rejecting a cursor not issued by the selected adapter;
+- rejecting an unsupported provider operation without invoking it;
+- verifying a shared adapter contract against providers with different capabilities;
 - saving external comments without duplicates;
 - optimistic-locking conflict;
 - replying to a comment at arbitrary depth;

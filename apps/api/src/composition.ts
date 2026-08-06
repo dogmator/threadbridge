@@ -9,14 +9,19 @@ import {
 } from '@threadbridge/comments';
 import postgres from 'postgres';
 import {DemoSocialCommentsGateway} from './adapters/demo/demo-comments-gateway.js';
+import {LimitedDemoSocialCommentsGateway}
+    from './adapters/demo/limited-demo-comments-gateway.js';
 import {PostgresCommentReplyContextRepository}
     from './adapters/postgres/comment-reply-context-repository.js';
 import {PostgresCommentRepository} from './adapters/postgres/comment-repository.js';
 import {PostgresPublishedPostRepository} from './adapters/postgres/published-post-repository.js';
+import {PostgresReplyPublicationOperationRepository}
+    from './adapters/postgres/reply-publication-operation-repository.js';
 import type {ApiServerDependencies} from './server.js';
 import {SHUTDOWN_GRACE_PERIOD_MS} from './shutdown.js';
 
 const DEMO_PLATFORM = toSocialPlatform('demo');
+const LIMITED_DEMO_PLATFORM = toSocialPlatform('demo-limited');
 
 export interface ApiComponents {
     readonly dependencies: ApiServerDependencies;
@@ -33,8 +38,10 @@ export const createApiComponents = (databaseUrl: string): ApiComponents => {
     const publishedPosts = new PostgresPublishedPostRepository(sql);
     const replyContexts = new PostgresCommentReplyContextRepository(sql);
     const comments = new PostgresCommentRepository(sql);
+    const publicationOperations = new PostgresReplyPublicationOperationRepository(sql);
     const gateways = new Map<SocialPlatform, SocialCommentsGateway>([
         [DEMO_PLATFORM, new DemoSocialCommentsGateway()],
+        [LIMITED_DEMO_PLATFORM, new LimitedDemoSocialCommentsGateway()],
     ]);
 
     return {
@@ -42,7 +49,15 @@ export const createApiComponents = (databaseUrl: string): ApiComponents => {
             requestIdFactory: randomUUID,
             getPostComments: new GetPostComments(publishedPosts, gateways, comments),
             getCommentReplies: new GetCommentReplies(replyContexts, gateways, comments),
-            replyToComment: new ReplyToComment(replyContexts, gateways, comments),
+            // This adapter owns both active reply-context reads and explicit
+            // projection-deletion writes, so the same instance satisfies two narrow ports.
+            replyToComment: new ReplyToComment(
+                replyContexts,
+                gateways,
+                comments,
+                publicationOperations,
+                replyContexts,
+            ),
         },
         close: async (): Promise<void> => {
             await sql.end({timeout: SHUTDOWN_GRACE_PERIOD_MS / 1_000});

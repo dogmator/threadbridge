@@ -97,16 +97,14 @@ describe('DemoSocialCommentsGateway', () => {
         expect(page.nextCursor).toBeNull();
     });
 
-    it('treats a cursor it did not issue as an empty page instead of throwing', async () => {
-        const page = okPage(
-            await new DemoSocialCommentsGateway().getComments({
-                accountId,
-                externalPostId: demoPost,
-                cursor: toCursor('not-a-demo-cursor'),
-            }),
-        );
+    it('reports a cursor it did not issue as invalid', async () => {
+        const result = await new DemoSocialCommentsGateway().getComments({
+            accountId,
+            externalPostId: demoPost,
+            cursor: toCursor('not-a-demo-cursor'),
+        });
 
-        expect(page).toEqual({items: [], nextCursor: null});
+        expect(failureOf(result)).toEqual({code: 'PLATFORM_CURSOR_INVALID'});
     });
 
     it('translates a platform authentication failure', async () => {
@@ -119,14 +117,17 @@ describe('DemoSocialCommentsGateway', () => {
         expect(failureOf(result)).toEqual({code: 'PLATFORM_AUTHENTICATION_FAILED'});
     });
 
-    it('translates a platform rate limit failure', async () => {
+    it('translates a platform rate limit failure with a retry hint', async () => {
         const result = await new DemoSocialCommentsGateway().getComments({
             accountId,
             externalPostId: toExternalPostId('demo-rate-limited'),
             cursor: null,
         });
 
-        expect(failureOf(result)).toEqual({code: 'PLATFORM_RATE_LIMITED'});
+        expect(failureOf(result)).toEqual({
+            code: 'PLATFORM_RATE_LIMITED',
+            retryAfterSeconds: 30,
+        });
     });
 
     it('translates a platform unavailable failure for replies as well', async () => {
@@ -354,6 +355,12 @@ describe('platform registration', () => {
         };
         const recorded: SocialPlatform[] = [];
         const recordingGateway = (platform: SocialPlatform): SocialCommentsGateway => ({
+            capabilities: {
+                rootComments: true,
+                directReplies: true,
+                replyPublication: false,
+                publicationIdempotency: 'none',
+            },
             getComments: (): Promise<Result<PlatformCommentPage, PlatformFailure>> => {
                 recorded.push(platform);
 

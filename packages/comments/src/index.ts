@@ -17,6 +17,11 @@ export type {
 export type {Comment, CommentPage, NormalizedComment, PublishedReply} from './domain/comment.js';
 export type {CommentReplyContext} from './domain/comment-reply.js';
 export type {
+    ReplyPublicationFailureCode,
+    ReplyPublicationOperation,
+    ReplyPublicationStatus,
+} from './domain/reply-publication-operation.js';
+export type {
     CommentNotFoundFailure,
     CommentsFailure,
     IdempotencyConflictFailure,
@@ -55,12 +60,21 @@ export type {
 export type {PublishedPostContext} from './domain/post.js';
 export {err, ok} from './domain/result.js';
 export type {Result} from './domain/result.js';
+export type {CommentProjectionStateRepository}
+    from './ports/comment-projection-state-repository.js';
 export type {CommentReplyContextRepository} from './ports/comment-reply-context-repository.js';
 export type {CommentRepository, SavePublishedReplyResult} from './ports/comment-repository.js';
 export type {PublishedPostRepository} from './ports/published-post-repository.js';
 export type {
+    BeginReplyPublicationInput,
+    BeginReplyPublicationResult,
+    ReplyPublicationOperationRepository,
+} from './ports/reply-publication-operation-repository.js';
+export type {
     GetPlatformCommentsInput,
     GetPlatformRepliesInput,
+    PublicationIdempotency,
     ReplyToPlatformCommentInput,
+    SocialCommentsCapabilities,
     SocialCommentsGateway,
 } from './ports/social-comments-gateway.js';

@@ -26,6 +26,7 @@ import {
     type PublishedPostContext,
     type PublishedPostRepository,
     type Result,
+    type SocialCommentsCapabilities,
     type SocialCommentsGateway,
     type SocialPlatform,
 } from '@threadbridge/comments';
@@ -36,6 +37,13 @@ const demoPlatform = toSocialPlatform('demo');
 
 /** Records the cursor the transport handed over, so an opaque value can be checked end to end. */
 class RecordingGateway implements SocialCommentsGateway {
+    public readonly capabilities: SocialCommentsCapabilities = {
+        rootComments: true,
+        directReplies: false,
+        replyPublication: false,
+        publicationIdempotency: 'none',
+    };
+
     public readonly cursors: (Cursor | null)[] = [];
 
     public getComments(

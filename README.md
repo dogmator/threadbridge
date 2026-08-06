@@ -15,11 +15,19 @@ explicit Hexagonal Architecture with PostgreSQL projection storage and social-pl
 
 > Created by **Pavko**.
 
+## Requirements
+
+- Node.js `24.15.0` and npm `11.12.1` for local development.
+- PostgreSQL `18` or newer. The schema uses PostgreSQL 18's built-in `uuidv7()` function, and the
+  migration runner rejects older servers before taking the migration lock or executing DDL.
+- Docker with Compose support for the primary local and CI-compatible workflow.
+
 ## What it demonstrates
 
 - Explicit HTTP, application, domain/port, and adapter boundaries.
 - A normalized PostgreSQL projection while the social platform remains the source of truth.
-- Cursor-based retrieval and idempotent reply publication through a provider registry.
+- Explicit provider capabilities, adapter-owned cursor validation, and reply publication through a
+  provider registry.
 - Typed failures, checksum-verified serialized migrations, bounded HTTP input, and graceful shutdown.
 
 ## Capability guide
@@ -33,7 +41,8 @@ relevant code and tests.
 | Reply to a comment | `POST /comments` → `ReplyToComment` in `packages/comments/src/application/reply-to-comment.ts` | `tests/reply-to-comment.test.ts`, publication REST tests in `tests/integration.test.ts` |
 | Support multiple social platforms | The `SocialCommentsGateway` port and the platform registry in `apps/api/src/composition.ts`; use cases resolve a gateway by platform and never branch on a platform name | `tests/demo-gateway.test.ts` (a second registered gateway is routed to without touching application code), unsupported-platform cases in `tests/get-post-comments.test.ts` and `tests/get-comment-replies.test.ts` |
 | Expose the functionality through a REST API | `apps/api/src/server.ts` and `apps/api/src/router.ts` | `tests/server.test.ts`, `tests/http-limits.test.ts`, `tests/integration.test.ts` |
-| Database schema | `db/migrations/*.sql` defines `accounts`, `posts`, and `comments`; `apps/api/src/migrations.ts` maintains `schema_migrations` | `tests/migrations.test.ts`, schema and repository tests in `tests/integration.test.ts` |
+| Database schema | `db/migrations/*.sql` defines the projection and publication-operation schema; `apps/api/src/migrations.ts` maintains `schema_migrations`; [`docs/migrations.md`](./docs/migrations.md) documents deployment constraints | `tests/migrations.test.ts`, `tests/migration-safety.test.ts`, and schema/repository tests in `tests/integration.test.ts` |
+| Publication operation diagnostics | [`docs/publication-operations.md`](./docs/publication-operations.md) defines state meaning and safe investigation queries | `tests/reply-publication-lifecycle.test.ts`, `tests/publication-operation-invariants.integration.test.ts` |
 | API design | [`docs/openapi.yaml`](./docs/openapi.yaml) and [API at a glance](#api-at-a-glance) | REST integration tests plus `tests/http-error.test.ts` cover the response mappings |
 | Relevant TypeScript code | Strict TypeScript workspace under `apps/` and `packages/`, gated by `npm run check` | The whole suite runs inside the same gate |
 | Major design decisions | [`docs/architecture.md`](./docs/architecture.md) and [`SPECIFICATION.md`](./SPECIFICATION.md) | — |
@@ -58,8 +67,8 @@ const gateways = new Map<SocialPlatform, SocialCommentsGateway>([
 ```
 
 A post inherits its platform from the referenced `accounts` row, so requests are routed by data
-rather than platform-specific application branches. Application use cases do not branch on platform names. A platform with no registered
-gateway is reported as `UNSUPPORTED_PLATFORM`.
+rather than platform-specific application branches. Application use cases do not branch on platform
+names. A platform with no registered gateway is reported as `UNSUPPORTED_PLATFORM`.
 
 ## Architecture
 
@@ -94,29 +103,35 @@ sequenceDiagram
 
     Client->>HTTP: POST /comments + Idempotency-Key
     HTTP->>UseCase: validated request
-    UseCase->>DB: find local key
-    alt identical local replay
+    UseCase->>DB: begin/load operation by account and key
+    alt conflicting key reuse
+        DB-->>UseCase: fingerprint conflict
+        UseCase-->>HTTP: conflict (409)
+    else completed operation
         DB-->>UseCase: stored reply
         UseCase-->>HTTP: existing (200)
-    else new key
-        UseCase->>Provider: publish with the same key
-        Note over UseCase,Provider: Outside every PostgreSQL transaction and lock
-        alt provider confirms
-            Provider-->>UseCase: normalized reply
-            UseCase->>DB: short persistence transaction
-            alt row created
-                DB-->>UseCase: created reply
-                UseCase-->>HTTP: created (201)
-            else key/input conflict
-                DB-->>UseCase: idempotency conflict
-                UseCase-->>HTTP: conflict (409)
-            else concurrent local convergence
-                DB-->>UseCase: existing reply
-                UseCase-->>HTTP: existing (200)
+    else incomplete operation
+        UseCase->>DB: find stored reply by account and key
+        alt reply was stored before interrupted completion
+            DB-->>UseCase: stored reply
+            UseCase->>DB: mark operation published
+            UseCase-->>HTTP: existing (200)
+        else external write is required
+            UseCase->>Provider: publish with the same key
+            Note over UseCase,Provider: Outside every PostgreSQL transaction and lock
+            alt provider confirms
+                Provider-->>UseCase: normalized reply
+                UseCase->>DB: persist reply, then mark operation published
+                UseCase-->>HTTP: created or existing (201/200)
+            else retry would be unsafe
+                Provider-->>UseCase: indeterminate result
+                UseCase->>DB: mark operation indeterminate
+                UseCase-->>HTTP: INDETERMINATE_PLATFORM_RESULT (502)
+            else provider rejects or is temporarily unavailable
+                Provider-->>UseCase: typed failure
+                UseCase->>DB: mark terminal or retryable failure
+                UseCase-->>HTTP: mapped error
             end
-        else provider outcome is indeterminate
-            Provider-->>UseCase: indeterminate result
-            UseCase-->>HTTP: INDETERMINATE_PLATFORM_RESULT (502)
         end
     end
 ```
@@ -124,8 +139,8 @@ sequenceDiagram
 ## Features
 
 - Root-comment and direct-reply retrieval with cursor pagination.
-- Reply publication, local idempotency replay, and conflict detection.
-- A provider registry with a deterministic demo adapter and typed platform failures.
+- Durable, account-scoped reply publication with partial-completion recovery and conflict detection.
+- A provider registry with full and limited adapters, explicit capabilities, and typed failures.
 - PostgreSQL normalized projection and a same-post parent/reply database invariant.
 - SHA-256 migration checksums and advisory-lock serialization across application instances.
 - Bounded HTTP request handling, uniform error envelopes, and graceful SIGTERM/SIGINT shutdown.
@@ -184,15 +199,23 @@ docker compose down -v
 
 ## Idempotency and consistency
 
-ThreadBridge guarantees the **local** half of idempotency: PostgreSQL stores at most one comment row
-per idempotency key, concurrent requests converge locally, and a sequential identical replay does
-not call the provider again. The key is passed unchanged to the provider adapter.
+ThreadBridge scopes an idempotency key to one connected account. Before an external write, it
+creates or loads a durable publication operation identified by `(account_id, idempotency_key)` and
+compares the request fingerprint. The provider call remains outside every PostgreSQL transaction.
 
-Preventing duplicate **external** effects requires provider-side idempotency or an equivalent
-provider guarantee. Concurrent requests may both reach the adapter because the external call is
-deliberately outside PostgreSQL transactions and locks. The demo adapter provides provider-side
-deduplication in memory. An indeterminate provider outcome returns
-`INDETERMINATE_PLATFORM_RESULT` and is never retried automatically.
+A confirmed reply is stored in the comment projection and then attached to the operation. If the
+process stops between those two local writes, an identical replay first searches for the
+account-scoped comment and completes the operation without calling the provider again. A pending
+operation is retried only when the selected provider declares native publication idempotency; a
+provider without that guarantee becomes `indeterminate` rather than receiving a blind duplicate
+write.
+
+Operation states are explicit: `pending`, `published`, `retryable_failed`, `failed`, and
+`indeterminate`. Rate limits, timeouts, and temporary unavailability are retryable; authentication,
+permission, validation, missing-resource, and unsupported-operation failures are terminal for the
+unchanged request. An adapter must report `INDETERMINATE_PLATFORM_RESULT` whenever it cannot prove
+whether a non-idempotent external write took effect. State interpretation and read-only diagnostic
+queries are documented in the [reply publication operations runbook](./docs/publication-operations.md).
 
 Imported and published replies are constrained to the same post as their parent by a composite
 database foreign key. Root comments and arbitrary reply depth remain valid.
@@ -212,6 +235,11 @@ The HTTP transport enforces these limits before a use case runs:
 charset are allowed. Content is measured but never normalized or rewritten. On `413` or `415`, the
 server responds once, closes the connection after the response, and does not reuse unread request
 bytes for another request.
+
+Provider cursors remain opaque to clients, but adapters reject tokens they did not issue with
+`PLATFORM_CURSOR_INVALID` instead of silently treating them as the end of a list. A provider rate
+limit returns `429`; when the provider supplies a valid delay hint, ThreadBridge forwards it in the
+standard `Retry-After` response header.
 
 All API errors use one envelope:
 
@@ -234,14 +262,14 @@ These are ThreadBridge project design decisions and the reasoning behind them.
 | PostgreSQL holds a normalized projection; the platform stays the source of truth | Comments must be addressable by internal identifiers and joinable to accounts and posts, and a reply needs a durable idempotency record | The projection can lag the platform; retrieval always asks the platform rather than reading the projection back |
 | UUID v7 for identifiers generated here | Time-ordered keys keep index locality without exposing a sequence, and PostgreSQL 18 generates them natively | Ties the schema to PostgreSQL 18 or an equivalent generator |
 | Opaque cursor pagination | The comment volume of a real post is unbounded, and a cursor can carry a platform continuation token that an offset cannot | Clients cannot jump to an arbitrary page |
-| `Idempotency-Key` on `POST /comments` | A reply is an external side effect; a retried request must not create a second one | Only the local half is guaranteed here — see [Idempotency and consistency](#idempotency-and-consistency) |
+| Account-scoped `Idempotency-Key` on `POST /comments` | A reply is an external side effect; durable operation identity lets retries recover known local results before another provider call | External deduplication still depends on the selected provider capability — see [Idempotency and consistency](#idempotency-and-consistency) |
 | Reply as a comment row with `parent_comment_id` | A reply is a comment, and depth stays unrestricted without a second table | Retrieving a whole subtree would need recursion that this API deliberately does not offer |
 | Direct-reply retrieval as its own endpoint | A thread needs a way to walk one level down | One more route than root-comment retrieval alone |
 | A `version` column and its verified compare-and-set behavior | Editing is out of scope now, but the projection is the row a future edit would race on | Currently exercised by an integration test rather than a use case |
 | Migration checksums and an advisory lock | Silent drift of an applied migration is worse than a refusal to start, and several instances may start together | A deliberately edited migration requires a new file rather than an edit |
 | Transport request limits | The HTTP surface is public, so request bodies and selected fields are bounded before use cases run | Fixed limits rather than configurable, provider-specific limits |
 | Graceful shutdown | The process runs in a container that receives `SIGTERM`/`SIGINT`, so it stops accepting work and gives active requests a bounded grace period | The grace period is fixed and remaining connections are force-closed after it |
-| A deterministic in-memory demo adapter as the only platform | It proves the port end to end without credentials, network access, or a review-time API key | It forgets published replies on restart; a real adapter would not |
+| Deterministic full and limited demo adapters | They exercise different provider capabilities, cursor formats, and publication guarantees without credentials or network access | They are fixtures rather than real provider integrations and forget published replies on restart |
 | Node's built-in HTTP server, no framework | The routing surface is four routes; a framework would add dependencies without removing code | Routing and parsing are written explicitly |
 | Only one external runtime dependency: `postgres` | Fewer dependencies mean less to audit and less to keep current | No ORM, no validation library, no logger |
 
@@ -263,7 +291,8 @@ These are deliberate scope boundaries, not additional requirements.
 
 ## Development and quality checks
 
-Requirements: Node.js `24.15.0`, npm `11.12.1`, and Docker with Compose support.
+The local toolchain requirements are Node.js `24.15.0`, npm `11.12.1`, PostgreSQL `18+`, and Docker
+with Compose support.
 
 Run the complete quality gate inside Docker:
 
@@ -293,7 +322,7 @@ apps/api/             HTTP API, composition root, and adapters
 packages/comments/    Domain model, ports, and application use cases
 db/migrations/        Versioned SQL schema and demo seed migrations
 tests/                Unit, contract, migration, repository, and REST tests
-docs/                 Architecture notes and the OpenAPI contract
+docs/                 Architecture notes, operational notes, and the OpenAPI contract
 Dockerfile            Local/demo API image
 compose.yaml          Local API and PostgreSQL stack
 SPECIFICATION.md      Behavioral and architectural contract
@@ -310,6 +339,9 @@ project author, who owns the final design and code.
 - [Specification](./SPECIFICATION.md) — ThreadBridge's behavioral and architectural contract,
   including its project assumptions and design decisions.
 - [Architecture notes](./docs/architecture.md) — boundaries, migrations, consistency, and shutdown.
+- [Migration operations](./docs/migrations.md) — supported deployment shapes and migration safety.
+- [Reply publication operations](./docs/publication-operations.md) — state semantics and diagnostic
+  queries.
 - [OpenAPI specification](./docs/openapi.yaml) — machine-readable HTTP contract.
 - [CI workflow](./.github/workflows/ci.yml) — the repository quality gate.
 - [MIT License](./LICENSE) — licensing terms.

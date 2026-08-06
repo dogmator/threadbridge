@@ -52,6 +52,10 @@ export class GetPostComments {
             });
         }
 
+        if (!gateway.capabilities.rootComments) {
+            return err<GetPostCommentsFailure>({code: 'PLATFORM_OPERATION_UNSUPPORTED'});
+        }
+
         const platformPage = await gateway.getComments({
             accountId: post.accountId,
             externalPostId: post.externalPostId,

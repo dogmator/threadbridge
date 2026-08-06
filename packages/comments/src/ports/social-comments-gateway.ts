@@ -9,6 +9,20 @@ import type {
 import type {PlatformComment, PlatformCommentPage} from '../domain/platform.js';
 import type {Result} from '../domain/result.js';
 
+export type PublicationIdempotency = 'native' | 'none';
+
+/**
+ * Provider behavior the application can inspect before attempting an operation. The flags express
+ * real provider capabilities and guarantees; they do not merely mirror which methods exist on the
+ * TypeScript interface.
+ */
+export interface SocialCommentsCapabilities {
+    readonly rootComments: boolean;
+    readonly directReplies: boolean;
+    readonly replyPublication: boolean;
+    readonly publicationIdempotency: PublicationIdempotency;
+}
+
 export interface GetPlatformCommentsInput {
     readonly accountId: AccountId;
     readonly externalPostId: ExternalPostId;
@@ -29,6 +43,8 @@ export interface ReplyToPlatformCommentInput {
 }
 
 export interface SocialCommentsGateway {
+    readonly capabilities: SocialCommentsCapabilities;
+
     /**
      * Requests a single page of root comments from the external platform and translates external
      * failures into typed platform failures.
@@ -54,14 +70,16 @@ export interface SocialCommentsGateway {
      * honoured by provider-side idempotency or an equivalent provider guarantee. Two concurrent
      * requests carrying one key may both reach this method: the application deliberately does not
      * hold a database transaction or lock across the call, so PostgreSQL cannot and does not
-     * arbitrate what happens on the provider. What the application guarantees is local: one stored
-     * row per key, and one converged result for both callers. An adapter that cannot deduplicate
-     * on the provider side must not be described as exactly-once.
+     * arbitrate what happens on the provider. What the application guarantees is local and
+     * account-scoped: one durable publication operation per key, one converged comment projection,
+     * and recovery when a comment was stored before its operation was marked published. An adapter
+     * that cannot deduplicate on the provider side must declare `publicationIdempotency: 'none'`
+     * and must not be described as exactly-once.
      *
      * An adapter that cannot determine whether the external write happened must return
-     * `INDETERMINATE_PLATFORM_RESULT` rather than guess in either direction. Nothing is persisted
-     * for that outcome, and retrying it automatically remains forbidden, because a retry may
-     * duplicate a write that already succeeded.
+     * `INDETERMINATE_PLATFORM_RESULT` rather than guess in either direction. No comment is
+     * persisted for that outcome; the durable operation is marked indeterminate, and retrying it
+     * automatically remains forbidden because a retry may duplicate a write that already succeeded.
      */
     replyToComment(
         input: ReplyToPlatformCommentInput,

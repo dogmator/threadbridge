@@ -52,6 +52,10 @@ export class GetCommentReplies {
             });
         }
 
+        if (!gateway.capabilities.directReplies) {
+            return err<GetCommentRepliesFailure>({code: 'PLATFORM_OPERATION_UNSUPPORTED'});
+        }
+
         const platformPage = await gateway.getReplies({
             accountId: context.accountId,
             externalParentCommentId: context.externalParentCommentId,

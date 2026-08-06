@@ -23,8 +23,14 @@ const failures: {
         platform: toSocialPlatform('unregistered'),
     },
     PLATFORM_AUTHENTICATION_FAILED: {code: 'PLATFORM_AUTHENTICATION_FAILED'},
+    PLATFORM_PERMISSION_DENIED: {code: 'PLATFORM_PERMISSION_DENIED'},
+    PLATFORM_RESOURCE_NOT_FOUND: {code: 'PLATFORM_RESOURCE_NOT_FOUND'},
+    PLATFORM_VALIDATION_FAILED: {code: 'PLATFORM_VALIDATION_FAILED'},
     PLATFORM_RATE_LIMITED: {code: 'PLATFORM_RATE_LIMITED'},
+    PLATFORM_TIMEOUT: {code: 'PLATFORM_TIMEOUT'},
     PLATFORM_UNAVAILABLE: {code: 'PLATFORM_UNAVAILABLE'},
+    PLATFORM_OPERATION_UNSUPPORTED: {code: 'PLATFORM_OPERATION_UNSUPPORTED'},
+    PLATFORM_CURSOR_INVALID: {code: 'PLATFORM_CURSOR_INVALID'},
     IDEMPOTENCY_CONFLICT: {
         code: 'IDEMPOTENCY_CONFLICT',
         idempotencyKey: toIdempotencyKey('key-1'),
@@ -40,8 +46,17 @@ const expected = {
     COMMENT_NOT_FOUND: {status: 404, message: 'Comment was not found'},
     UNSUPPORTED_PLATFORM: {status: 422, message: 'Platform is not supported'},
     PLATFORM_AUTHENTICATION_FAILED: {status: 502, message: 'Platform authentication failed'},
+    PLATFORM_PERMISSION_DENIED: {status: 502, message: 'Platform permission was denied'},
+    PLATFORM_RESOURCE_NOT_FOUND: {status: 404, message: 'Platform resource was not found'},
+    PLATFORM_VALIDATION_FAILED: {status: 422, message: 'Platform rejected the request'},
     PLATFORM_RATE_LIMITED: {status: 429, message: 'Platform rate limit was exceeded'},
+    PLATFORM_TIMEOUT: {status: 504, message: 'Platform request timed out'},
     PLATFORM_UNAVAILABLE: {status: 503, message: 'Platform is unavailable'},
+    PLATFORM_OPERATION_UNSUPPORTED: {
+        status: 422,
+        message: 'Platform operation is not supported',
+    },
+    PLATFORM_CURSOR_INVALID: {status: 400, message: 'Platform cursor is invalid'},
     IDEMPOTENCY_CONFLICT: {
         status: 409,
         message: 'Idempotency key conflicts with an existing request',
@@ -66,6 +81,24 @@ describe('toHttpErrorResponse', () => {
         const response = toHttpErrorResponse(failures.PLATFORM_RATE_LIMITED, '019-abc-request');
 
         expect(response.body.error.requestId).toBe('019-abc-request');
+    });
+
+    it('returns Retry-After when a provider supplies a valid delay hint', () => {
+        const response = toHttpErrorResponse(
+            {code: 'PLATFORM_RATE_LIMITED', retryAfterSeconds: 30},
+            'request-1',
+        );
+
+        expect(response.headers).toEqual({'retry-after': '30'});
+    });
+
+    it('does not emit an invalid Retry-After value', () => {
+        const response = toHttpErrorResponse(
+            {code: 'PLATFORM_RATE_LIMITED', retryAfterSeconds: -1},
+            'request-1',
+        );
+
+        expect(response).not.toHaveProperty('headers');
     });
 
     it('never leaks structured failure fields into the response body', () => {

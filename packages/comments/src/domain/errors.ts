@@ -1,14 +1,19 @@
 import type {CommentId, IdempotencyKey, PostId, SocialPlatform} from './identifiers.js';
 
 /**
- * Failures a social-platform adapter translates external errors into. They carry the discriminant
- * only: raw provider payloads, credentials, tokens, and provider messages must never leave an
- * adapter.
+ * Failures a social-platform adapter translates external errors into. Raw provider payloads,
+ * credentials, tokens, and provider messages must never leave an adapter.
  */
 export type PlatformFailure =
     | {readonly code: 'PLATFORM_AUTHENTICATION_FAILED'}
-    | {readonly code: 'PLATFORM_RATE_LIMITED'}
-    | {readonly code: 'PLATFORM_UNAVAILABLE'};
+    | {readonly code: 'PLATFORM_PERMISSION_DENIED'}
+    | {readonly code: 'PLATFORM_RESOURCE_NOT_FOUND'}
+    | {readonly code: 'PLATFORM_VALIDATION_FAILED'}
+    | {readonly code: 'PLATFORM_RATE_LIMITED'; readonly retryAfterSeconds?: number}
+    | {readonly code: 'PLATFORM_TIMEOUT'}
+    | {readonly code: 'PLATFORM_UNAVAILABLE'}
+    | {readonly code: 'PLATFORM_OPERATION_UNSUPPORTED'}
+    | {readonly code: 'PLATFORM_CURSOR_INVALID'};
 
 export interface CommentNotFoundFailure {
     readonly code: 'COMMENT_NOT_FOUND';
