@@ -1,11 +1,11 @@
-import {
-    type AccountId,
-    type Comment,
-    type CommentRepository,
-    type IdempotencyKey,
-    type NormalizedComment,
-    type PublishedReply,
-    type SavePublishedReplyResult,
+import type {
+    AccountId,
+    Comment,
+    CommentRepository,
+    IdempotencyKey,
+    NormalizedComment,
+    PublishedReply,
+    SavePublishedReplyResult,
 } from '@threadbridge/comments';
 import type {Sql} from 'postgres';
 import {toComment, type CommentRow} from './comment-row.js';
