@@ -16,11 +16,52 @@ interface ChecksumColumnRow {
     readonly attnotnull: boolean;
 }
 
+interface ServerVersionRow {
+    readonly server_version_num: string;
+    readonly server_version: string;
+}
+
+const MINIMUM_POSTGRES_SERVER_VERSION_NUM = 180_000;
+
 const checksumOf = (content: string): string =>
     createHash('sha256').update(content, 'utf8').digest('hex');
 
 const asError = (value: unknown): Error =>
     value instanceof Error ? value : new Error('Migration failed with a non-Error value.');
+
+/**
+ * Validates the server version before the runner takes a lock or executes any DDL. PostgreSQL 18 is
+ * the first supported release because the checked-in schema uses its built-in uuidv7() function.
+ */
+export const assertSupportedPostgresVersion = (
+    serverVersionNum: string,
+    serverVersion: string,
+): void => {
+    const versionNumber = Number.parseInt(serverVersionNum, 10);
+    const isNumeric = /^\d+$/u.test(serverVersionNum);
+
+    if (!isNumeric || versionNumber < MINIMUM_POSTGRES_SERVER_VERSION_NUM) {
+        throw new Error(
+            'ThreadBridge requires PostgreSQL 18 or newer; connected server reports '
+            + `${serverVersion}. No migration was applied.`,
+        );
+    }
+};
+
+const ensureSupportedPostgresVersion = async (sql: Sql): Promise<void> => {
+    const rows = await sql<ServerVersionRow[]>`
+        select
+            current_setting('server_version_num') as server_version_num,
+            current_setting('server_version') as server_version
+    `;
+    const server = rows.at(0);
+
+    if (server === undefined) {
+        throw new Error('PostgreSQL did not report its server version. No migration was applied.');
+    }
+
+    assertSupportedPostgresVersion(server.server_version_num, server.server_version);
+};
 
 /**
  * Runs one migration in its own transaction on the caller's session.
@@ -197,12 +238,12 @@ const applyMigrations = async (sql: Sql, directory: string): Promise<readonly st
 /**
  * Serializes the whole migration run across application instances.
  *
- * Every instance takes one session-level advisory lock on a reserved connection before it inspects
- * the history and holds it until the last pending migration is applied, so two instances starting
- * together cannot both run the same DDL: the second one waits, then observes a completed history
- * and applies nothing. The lock is session-scoped rather than transaction-scoped precisely because
- * each migration keeps its own transaction; wrapping every migration in one transaction to obtain
- * a transaction-scoped lock would trade a real guarantee for a worse one.
+ * The supported PostgreSQL version is checked before the runner takes the advisory lock or executes
+ * DDL. Every supported instance then takes one session-level advisory lock on a reserved connection
+ * before it inspects the history and holds it until the last pending migration is applied, so two
+ * instances starting together cannot both run the same DDL: the second one waits, then observes a
+ * completed history and applies nothing. The lock is session-scoped rather than transaction-scoped
+ * precisely because each migration keeps its own transaction.
  *
  * The lock is released whether the run succeeded, found an edited or missing migration, or failed
  * inside a migration, and the original error is never replaced by a failure to release.
@@ -214,6 +255,7 @@ export const runMigrations = async (sql: Sql, directory: string): Promise<readon
     let failure: Error | null = null;
 
     try {
+        await ensureSupportedPostgresVersion(reserved);
         await reserved`
             select pg_advisory_lock(${MIGRATION_LOCK_NAMESPACE}, ${MIGRATION_LOCK_ID})
         `;

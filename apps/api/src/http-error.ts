@@ -10,6 +10,7 @@ export interface HttpErrorEnvelope {
 
 export interface HttpErrorResponse {
     readonly status: number;
+    readonly headers?: Readonly<Record<string, string>>;
     readonly body: HttpErrorEnvelope;
 }
 
@@ -18,6 +19,21 @@ export const toErrorEnvelope = (
     message: string,
     requestId: string,
 ): HttpErrorEnvelope => ({error: {code, message, requestId}});
+
+const response = (
+    status: number,
+    failure: CommentsFailure,
+    message: string,
+    requestId: string,
+): HttpErrorResponse => ({
+    status,
+    body: toErrorEnvelope(failure.code, message, requestId),
+});
+
+const retryAfterHeader = (seconds: number | undefined): Readonly<Record<string, string>> | undefined =>
+    seconds !== undefined && Number.isSafeInteger(seconds) && seconds >= 0
+        ? {'retry-after': String(seconds)}
+        : undefined;
 
 /**
  * Chooses the status and the safe client-facing message of a core failure. Structured failure
@@ -29,52 +45,46 @@ export const toHttpErrorResponse = (
 ): HttpErrorResponse => {
     switch (failure.code) {
         case 'POST_NOT_FOUND':
-            return {
-                status: 404,
-                body: toErrorEnvelope(failure.code, 'Post was not found', requestId),
-            };
+            return response(404, failure, 'Post was not found', requestId);
         case 'COMMENT_NOT_FOUND':
-            return {
-                status: 404,
-                body: toErrorEnvelope(failure.code, 'Comment was not found', requestId),
-            };
+            return response(404, failure, 'Comment was not found', requestId);
         case 'UNSUPPORTED_PLATFORM':
-            return {
-                status: 422,
-                body: toErrorEnvelope(failure.code, 'Platform is not supported', requestId),
-            };
+            return response(422, failure, 'Platform is not supported', requestId);
         case 'PLATFORM_AUTHENTICATION_FAILED':
-            return {
-                status: 502,
-                body: toErrorEnvelope(failure.code, 'Platform authentication failed', requestId),
-            };
-        case 'PLATFORM_RATE_LIMITED':
-            return {
-                status: 429,
-                body: toErrorEnvelope(
-                    failure.code,
-                    'Platform rate limit was exceeded',
-                    requestId,
-                ),
-            };
+            return response(502, failure, 'Platform authentication failed', requestId);
+        case 'PLATFORM_PERMISSION_DENIED':
+            return response(502, failure, 'Platform permission was denied', requestId);
+        case 'PLATFORM_RESOURCE_NOT_FOUND':
+            return response(404, failure, 'Platform resource was not found', requestId);
+        case 'PLATFORM_VALIDATION_FAILED':
+            return response(422, failure, 'Platform rejected the request', requestId);
+        case 'PLATFORM_RATE_LIMITED': {
+            const mapped = response(
+                429,
+                failure,
+                'Platform rate limit was exceeded',
+                requestId,
+            );
+            const headers = retryAfterHeader(failure.retryAfterSeconds);
+
+            return headers === undefined ? mapped : {...mapped, headers};
+        }
+        case 'PLATFORM_TIMEOUT':
+            return response(504, failure, 'Platform request timed out', requestId);
         case 'PLATFORM_UNAVAILABLE':
-            return {
-                status: 503,
-                body: toErrorEnvelope(failure.code, 'Platform is unavailable', requestId),
-            };
+            return response(503, failure, 'Platform is unavailable', requestId);
+        case 'PLATFORM_OPERATION_UNSUPPORTED':
+            return response(422, failure, 'Platform operation is not supported', requestId);
+        case 'PLATFORM_CURSOR_INVALID':
+            return response(400, failure, 'Platform cursor is invalid', requestId);
         case 'IDEMPOTENCY_CONFLICT':
-            return {
-                status: 409,
-                body: toErrorEnvelope(
-                    failure.code,
-                    'Idempotency key conflicts with an existing request',
-                    requestId,
-                ),
-            };
+            return response(
+                409,
+                failure,
+                'Idempotency key conflicts with an existing request',
+                requestId,
+            );
         case 'INDETERMINATE_PLATFORM_RESULT':
-            return {
-                status: 502,
-                body: toErrorEnvelope(failure.code, 'Platform result is indeterminate', requestId),
-            };
+            return response(502, failure, 'Platform result is indeterminate', requestId);
     }
 };

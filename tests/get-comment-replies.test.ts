@@ -91,6 +91,13 @@ class StubCommentReplyContextRepository implements CommentReplyContextRepository
 }
 
 class StubSocialCommentsGateway implements SocialCommentsGateway {
+    public readonly capabilities = {
+        rootComments: true,
+        directReplies: true,
+        replyPublication: false,
+        publicationIdempotency: 'none',
+    } as const;
+
     public readonly receivedInputs: GetPlatformRepliesInput[] = [];
 
     public constructor(private readonly response: Result<PlatformCommentPage, PlatformFailure>) {}

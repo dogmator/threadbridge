@@ -4,6 +4,7 @@ import {
     toPostId,
     toSocialPlatform,
     type CommentId,
+    type CommentProjectionStateRepository,
     type CommentReplyContext,
     type CommentReplyContextRepository,
 } from '@threadbridge/comments';
@@ -16,7 +17,8 @@ interface CommentReplyContextRow {
     readonly external_parent_comment_id: string;
 }
 
-export class PostgresCommentReplyContextRepository implements CommentReplyContextRepository {
+export class PostgresCommentReplyContextRepository
+implements CommentReplyContextRepository, CommentProjectionStateRepository {
     public constructor(private readonly sql: Sql) {}
 
     public async findByCommentId(commentId: CommentId): Promise<CommentReplyContext | null> {
@@ -29,6 +31,7 @@ export class PostgresCommentReplyContextRepository implements CommentReplyContex
             join posts on posts.id = comments.post_id
             join accounts on accounts.id = posts.account_id
             where comments.id = ${commentId}
+              and comments.projection_state = 'active'
         `;
         const row = rows.at(0);
 
@@ -42,5 +45,17 @@ export class PostgresCommentReplyContextRepository implements CommentReplyContex
             platform: toSocialPlatform(row.platform),
             externalParentCommentId: toExternalCommentId(row.external_parent_comment_id),
         };
+    }
+
+    public async markDeleted(commentId: CommentId): Promise<void> {
+        await this.sql`
+            update comments
+            set projection_state = 'deleted',
+                deleted_at = coalesce(deleted_at, now()),
+                updated_at = now(),
+                version = version + 1
+            where id = ${commentId}
+              and projection_state <> 'deleted'
+        `;
     }
 }

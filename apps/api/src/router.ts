@@ -41,8 +41,10 @@ const writeJson = (
         | CommentPageResponse
         | CommentResponse
         | HttpErrorEnvelope,
+    headers: Readonly<Record<string, string>> = {},
 ): void => {
     response.writeHead(statusCode, {
+        ...headers,
         'content-type': 'application/json; charset=utf-8',
     }).end(JSON.stringify(body));
 };
@@ -54,7 +56,7 @@ const writeFailure = (
 ): void => {
     const mapped = toHttpErrorResponse(failure, dependencies.requestIdFactory());
 
-    writeJson(response, mapped.status, mapped.body);
+    writeJson(response, mapped.status, mapped.body, mapped.headers);
 };
 
 /**

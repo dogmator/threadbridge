@@ -10,6 +10,7 @@ import {
     toIdempotencyKey,
     toPostId,
     toSocialPlatform,
+    type AccountId,
     type Comment,
     type CommentId,
     type CommentReplyContext,
@@ -85,6 +86,13 @@ class StubReplyContextRepository implements CommentReplyContextRepository {
 }
 
 class StubGateway implements SocialCommentsGateway {
+    public readonly capabilities = {
+        rootComments: false,
+        directReplies: false,
+        replyPublication: true,
+        publicationIdempotency: 'none',
+    } as const;
+
     public readonly receivedInputs: ReplyToPlatformCommentInput[] = [];
 
     public constructor(
@@ -128,7 +136,10 @@ class StubCommentRepository implements CommentRepository {
         throw new Error('ReplyToComment must not import comments.');
     }
 
-    public findByIdempotencyKey(key: IdempotencyKey): Promise<Comment | null> {
+    public findByIdempotencyKey(
+        _accountId: AccountId,
+        key: IdempotencyKey,
+    ): Promise<Comment | null> {
         this.lookedUpKeys.push(key);
 
         return Promise.resolve(this.existing);

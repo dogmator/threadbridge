@@ -1,4 +1,4 @@
-import {mkdtemp, rm, writeFile} from 'node:fs/promises';
+import {mkdtemp, readFile, rm, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join, resolve} from 'node:path';
 import postgres, {type Sql} from 'postgres';
@@ -27,26 +27,6 @@ interface MigrationRecordRow {
 interface RelationRow {
     readonly relation: string | null;
 }
-
-interface CountRow {
-    readonly count: string;
-}
-
-/** The advisory-lock key runMigrations takes, mirrored here to observe it in pg_locks. */
-const MIGRATION_LOCK_NAMESPACE = 0x54_42_00_01;
-const MIGRATION_LOCK_ID = 1;
-
-const heldMigrationLocks = async (sql: Sql): Promise<number> => {
-    const rows = await sql<CountRow[]>`
-        select count(*)::text as count from pg_locks
-        where locktype = 'advisory'
-          and classid = ${MIGRATION_LOCK_NAMESPACE}
-          and objid = ${MIGRATION_LOCK_ID}
-          and granted
-    `;
-
-    return Number.parseInt(rows.at(0)?.count ?? '0', 10);
-};
 
 /**
  * Runs one scenario against a private PostgreSQL schema and a private migration directory. A
@@ -139,13 +119,80 @@ describe('runMigrations', () => {
                 '0001_initial_schema.sql',
                 '0002_demo_seed.sql',
                 '0003_comment_parent_post_consistency.sql',
+                '0004_provider_boundary_hardening.sql',
+                '0005_limited_demo_seed.sql',
             ]);
             expect(records.map((record): string => record.name)).toEqual([
                 '0001_initial_schema.sql',
                 '0002_demo_seed.sql',
                 '0003_comment_parent_post_consistency.sql',
+                '0004_provider_boundary_hardening.sql',
+                '0005_limited_demo_seed.sql',
             ]);
             expect(records.every((record): boolean => record.checksum?.length === 64)).toBe(true);
+        });
+    });
+
+    it('backfills lifecycle columns for comments created before the hardening migration', async () => {
+        await withMigrationScenario(async (sql, directory): Promise<void> => {
+  const baselineName = '0001_initial_schema.sql';
+  const hardeningName = '0004_provider_boundary_hardening.sql';
+
+  await writeFile(
+      join(directory, baselineName),
+      await readFile(join(checkedInMigrations, baselineName), 'utf8'),
+  );
+  await runMigrations(sql, directory);
+  await sql`
+      insert into accounts (id, platform, external_account_id)
+      values ('0198f100-0000-7000-8000-000000000001', 'probe', 'probe-account')
+  `;
+  await sql`
+      insert into posts (id, account_id, external_post_id, published_at)
+      values (
+          '0198f100-0000-7000-8000-000000000002',
+          '0198f100-0000-7000-8000-000000000001',
+          'probe-post',
+          timestamptz '2026-02-01 00:00:00+00'
+      )
+  `;
+  await sql`
+      insert into comments (
+          id, post_id, external_comment_id, external_author_id, content,
+          platform_created_at, created_at, updated_at
+      ) values (
+          '0198f100-0000-7000-8000-000000000003',
+          '0198f100-0000-7000-8000-000000000002',
+          'probe-comment',
+          'probe-author',
+          'Existing projection',
+          timestamptz '2026-02-01 00:00:00+00',
+          timestamptz '2026-02-02 00:00:00+00',
+          timestamptz '2026-02-03 00:00:00+00'
+      )
+  `;
+  await writeFile(
+      join(directory, hardeningName),
+      await readFile(join(checkedInMigrations, hardeningName), 'utf8'),
+  );
+
+  expect(await runMigrations(sql, directory)).toEqual([hardeningName]);
+
+  const rows = await sql<{
+      projection_state: string;
+      last_observed_at: Date;
+      updated_at: Date;
+      deleted_at: Date | null;
+  }[]>`
+      select projection_state, last_observed_at, updated_at, deleted_at
+      from comments
+      where id = '0198f100-0000-7000-8000-000000000003'
+  `;
+  const row = rows.at(0);
+
+  expect(row?.projection_state).toBe('active');
+  expect(row?.last_observed_at).toEqual(row?.updated_at);
+  expect(row?.deleted_at).toBeNull();
         });
     });
 
@@ -327,7 +374,7 @@ describe('runMigrations across instances', () => {
 
             await runMigrations(first, directory);
 
-            expect(await heldMigrationLocks(second)).toBe(0);
+            expect(await runMigrations(second, directory)).toEqual([]);
         });
     });
 
@@ -339,10 +386,9 @@ describe('runMigrations across instances', () => {
 
             await expect(runMigrations(first, directory)).rejects.toThrow(/syntax error/iu);
 
-            expect(await heldMigrationLocks(second)).toBe(0);
             expect(await recordsOf(second)).toEqual([]);
 
-            // The lock is free, so a corrected run proceeds instead of waiting for a lost holder.
+            // A corrected run on another client proves the failed session released the lock.
             await writeFile(file, 'create table repaired (id integer);\n');
 
             const applied = await runMigrations(second, directory);
@@ -352,7 +398,6 @@ describe('runMigrations across instances', () => {
 
             expect(applied).toEqual(['0001_broken.sql']);
             expect(relations.at(0)?.relation).not.toBeNull();
-            expect(await heldMigrationLocks(first)).toBe(0);
         });
     });
 
@@ -370,13 +415,11 @@ describe('runMigrations across instances', () => {
 
             await expect(runMigrations(first, directory)).rejects.toThrow(/foreign key/iu);
 
-            expect(await heldMigrationLocks(second)).toBe(0);
             expect(await recordsOf(second)).toEqual([]);
 
             await writeFile(file, 'create table repaired_after_commit_failure (id integer);\n');
 
             expect(await runMigrations(second, directory)).toEqual(['0001_deferred.sql']);
-            expect(await heldMigrationLocks(first)).toBe(0);
         });
     });
 
@@ -392,7 +435,10 @@ describe('runMigrations across instances', () => {
                 /Applied migrations are missing/u,
             );
 
-            expect(await heldMigrationLocks(second)).toBe(0);
+            // Restoring the verified file lets another client acquire the lock and validate history.
+            await writeFile(file, 'create table probe (id integer);\n');
+            expect(await runMigrations(second, directory)).toEqual([]);
+
         });
     });
 });

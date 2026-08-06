@@ -13,6 +13,7 @@ import {
     type PlatformFailure,
     type ReplyToPlatformCommentInput,
     type Result,
+    type SocialCommentsCapabilities,
     type SocialCommentsGateway,
 } from '@threadbridge/comments';
 
@@ -53,18 +54,22 @@ const replies = new Map<string, readonly PlatformComment[]>([
 
 /**
  * External identifiers reserved for demonstrating failure translation. They apply to posts and to
- * parent comments alike, so both gateway operations can be exercised.
+ * parent comments alike, so every gateway operation can be exercised.
  */
 const failures = new Map<string, PlatformFailure>([
     ['demo-authentication-failure', {code: 'PLATFORM_AUTHENTICATION_FAILED'}],
-    ['demo-rate-limited', {code: 'PLATFORM_RATE_LIMITED'}],
+    ['demo-permission-denied', {code: 'PLATFORM_PERMISSION_DENIED'}],
+    ['demo-resource-not-found', {code: 'PLATFORM_RESOURCE_NOT_FOUND'}],
+    ['demo-validation-failure', {code: 'PLATFORM_VALIDATION_FAILED'}],
+    ['demo-rate-limited', {code: 'PLATFORM_RATE_LIMITED', retryAfterSeconds: 30}],
+    ['demo-timeout', {code: 'PLATFORM_TIMEOUT'}],
     ['demo-unavailable', {code: 'PLATFORM_UNAVAILABLE'}],
 ]);
 
 const encodeCursor = (offset: number): Cursor =>
     toCursor(Buffer.from(String(offset), 'utf8').toString('base64url'));
 
-/** Returns null for a cursor this adapter did not issue, which yields an empty page. */
+/** Returns null for a cursor this adapter did not issue. */
 const decodeOffset = (cursor: Cursor | null): number | null => {
     if (cursor === null) {
         return 0;
@@ -94,7 +99,7 @@ const pageOf = (
     const offset = decodeOffset(cursor);
 
     if (offset === null) {
-        return ok<PlatformCommentPage>({items: [], nextCursor: null});
+        return {ok: false, error: {code: 'PLATFORM_CURSOR_INVALID'}};
     }
 
     const nextOffset = offset + PAGE_SIZE;
@@ -111,6 +116,13 @@ const pageOf = (
  * platform.
  */
 export class DemoSocialCommentsGateway implements SocialCommentsGateway {
+    public readonly capabilities: SocialCommentsCapabilities = {
+        rootComments: true,
+        directReplies: true,
+        replyPublication: true,
+        publicationIdempotency: 'native',
+    };
+
     /** Replies published through this adapter instance, keyed by idempotency key. */
     private readonly publishedByKey = new Map<string, PlatformComment>();
 

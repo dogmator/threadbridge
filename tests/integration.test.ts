@@ -37,6 +37,7 @@ import {
     type PublishedReply,
     type ReplyToPlatformCommentInput,
     type Result,
+    type SocialCommentsCapabilities,
     type SocialCommentsGateway,
     type SocialPlatform,
 } from '@threadbridge/comments';
@@ -114,6 +115,12 @@ beforeAll(async (): Promise<void> => {
 
 afterAll(async (): Promise<void> => {
     await sql`
+        delete from reply_publication_operations
+        where account_id in (
+            select id from accounts where external_account_id = ${fixtureExternalAccountId}
+        )
+    `;
+    await sql`
         delete from comments
         where post_id in (
             select posts.id from posts
@@ -141,6 +148,8 @@ describe('migrations', () => {
             '0001_initial_schema.sql',
             '0002_demo_seed.sql',
             '0003_comment_parent_post_consistency.sql',
+            '0004_provider_boundary_hardening.sql',
+            '0005_limited_demo_seed.sql',
         ]);
         expect(rows.every((row): boolean => row.checksum.length === 64)).toBe(true);
     });
@@ -163,14 +172,23 @@ describe('migrations', () => {
             where accounts.external_account_id = 'demo-account-1'
               and posts.external_post_id = 'demo-post-1'
         `;
+        const limitedSeededPosts = await sql<IdRow[]>`
+            select posts.id from posts
+            join accounts on accounts.id = posts.account_id
+            where accounts.external_account_id = 'demo-limited-account-1'
+              and posts.external_post_id = 'limited-post-1'
+        `;
 
         expect(tables.map((row): string => row.table_name)).toEqual([
             'accounts',
             'comments',
             'posts',
+            'reply_publication_operations',
             'schema_migrations',
         ]);
         expect(seededPosts.at(0)?.id).toBe('0198f000-0000-7000-8000-000000000002');
+        expect(limitedSeededPosts.at(0)?.id)
+            .toBe('0198f000-0000-7000-8000-000000000004');
     });
 });
 
@@ -389,7 +407,7 @@ describe('PostgresCommentRepository publication', () => {
     it('returns null for an unused idempotency key', async () => {
         const repository = new PostgresCommentRepository(sql);
 
-        expect(await repository.findByIdempotencyKey(toIdempotencyKey('unused-key'))).toBeNull();
+        expect(await repository.findByIdempotencyKey(fixtureAccountId, toIdempotencyKey('unused-key'))).toBeNull();
     });
 
     it('persists a published reply with every field and a fresh identity', async () => {
@@ -415,7 +433,7 @@ describe('PostgresCommentRepository publication', () => {
         expect(saved.comment.content).toBe('A published reply');
         expect(saved.comment.idempotencyKey).toBe(key);
         expect(saved.comment.metadata).toEqual({source: 'integration'});
-        expect(await repository.findByIdempotencyKey(key)).toEqual(saved.comment);
+        expect(await repository.findByIdempotencyKey(fixtureAccountId, key)).toEqual(saved.comment);
     });
 
     it('converges a repeated publication of the same key on one row', async () => {
@@ -511,7 +529,9 @@ describe('PostgresCommentRepository publication', () => {
         // Without the lock the repository would insert concurrently and hit the unique index.
         const holder = sql.begin<string>(async (transaction): Promise<string> => {
             await transaction`
-                select pg_advisory_xact_lock(hashtextextended(${key}::text, 0))
+                select pg_advisory_xact_lock(
+                    hashtextextended(${`${fixtureAccountId}:${key}`}::text, 0)
+                )
             `;
 
             const rows = await transaction<IdRow[]>`
@@ -658,13 +678,20 @@ describe('PostgresCommentRepository publication', () => {
         expect(saved.comment.id).toBe(first.comment.id);
         expect(saved.comment.createdAt).toEqual(first.comment.createdAt);
         expect(rows).toHaveLength(1);
-        expect(await repository.findByIdempotencyKey(toIdempotencyKey('integration-key-10')))
+        expect(await repository.findByIdempotencyKey(fixtureAccountId, toIdempotencyKey('integration-key-10')))
             .toBeNull();
     });
 });
 
 /** Answers each publication with a distinct external comment id, as a real platform might. */
 class DivergingGateway implements SocialCommentsGateway {
+    public readonly capabilities: SocialCommentsCapabilities = {
+        rootComments: false,
+        directReplies: false,
+        replyPublication: true,
+        publicationIdempotency: 'none',
+    };
+
     private calls = 0;
 
     public constructor(private readonly externalIdPrefix: string) {}
@@ -726,6 +753,13 @@ class Barrier {
  * identity in hand instead of relying on scheduling luck.
  */
 class ConvergingGateway implements SocialCommentsGateway {
+    public readonly capabilities: SocialCommentsCapabilities = {
+        rootComments: false,
+        directReplies: false,
+        replyPublication: true,
+        publicationIdempotency: 'native',
+    };
+
     public constructor(
         private readonly externalCommentId: ExternalCommentId,
         private readonly barrier: Barrier | null = null,
@@ -913,7 +947,7 @@ describe('ReplyToComment against real PostgreSQL', () => {
         });
         expect(rows).toHaveLength(1);
         expect(rows.at(0)?.idempotency_key).toBe(owner);
-        expect(await comments.findByIdempotencyKey(loser)).toBeNull();
+        expect(await comments.findByIdempotencyKey(fixtureAccountId, loser)).toBeNull();
     });
 
     it('resolves a concurrent different-key collision as one row and one conflict', async () => {
@@ -972,6 +1006,13 @@ describe('ReplyToComment against real PostgreSQL', () => {
  * the provider guarantee can.
  */
 class ProviderIdempotentGateway implements SocialCommentsGateway {
+    public readonly capabilities: SocialCommentsCapabilities = {
+        rootComments: false,
+        directReplies: false,
+        replyPublication: true,
+        publicationIdempotency: 'native',
+    };
+
     public externalPublications = 0;
 
     private readonly publishedByKey = new Map<string, PlatformComment>();
@@ -1168,6 +1209,14 @@ describe('retrieval REST endpoints', () => {
         server.closeAllConnections();
         await once(server, 'close');
         await components.close();
+        await sql`
+            delete from reply_publication_operations
+            where parent_comment_id in (
+                select id from comments where post_id = ${DEMO_POST_ID}
+            ) or comment_id in (
+                select id from comments where post_id = ${DEMO_POST_ID}
+            )
+        `;
         await sql`delete from comments where post_id = ${DEMO_POST_ID}`;
     });
 

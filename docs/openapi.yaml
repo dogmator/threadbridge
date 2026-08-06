@@ -14,23 +14,21 @@ info:
 
     `POST /comments` requires an `Idempotency-Key` header, and two distinct guarantees apply to it.
 
-    The **local** guarantee is owned by ThreadBridge and is unconditional. PostgreSQL keeps at most
-    one comment row per idempotency key, concurrent requests carrying one key converge on that row
-    and report the same identifier, and a sequential replay is answered from the local projection
-    without calling the provider again. An identical replay returns `200` with the stored resource;
-    the same key with different input returns `409`.
+    The **local** guarantee is account-scoped and durable. Before the provider is called,
+    ThreadBridge creates or loads a publication operation identified by the connected account and
+    `Idempotency-Key`. Concurrent identical requests converge on that operation. A completed request
+    is replayed from the local projection with `200`; reuse of the same account-scoped key with a
+    different parent or content returns `409`.
 
-    The **external** guarantee — that one key produces at most one reply on the social platform —
-    can only be given by the platform. The provider call deliberately runs outside every database
-    transaction and lock, so two concurrent requests sharing a key may both reach the provider
-    adapter. The same key is passed to the provider for exactly that reason: an adapter forwards it
-    as the provider's own idempotency token or relies on an equivalent provider guarantee. Where no
-    such guarantee exists, ThreadBridge does not manufacture one, and this API must not be read as
-    promising exactly-once delivery.
+    The **external** guarantee depends on the selected provider. The provider call deliberately runs
+    outside every database transaction and lock. An adapter declaring native publication idempotency
+    may safely receive the same key again; an adapter without that guarantee is never blindly retried
+    after an incomplete attempt.
 
-    When an adapter cannot determine whether the external write happened, the request fails with
-    `502 INDETERMINATE_PLATFORM_RESULT`. Nothing is persisted for that outcome and it is never
-    retried automatically.
+    When an adapter cannot determine whether the external write happened, the operation is persisted
+    as `indeterminate` and the request fails with `502 INDETERMINATE_PLATFORM_RESULT`. No comment is
+    created for that uncertain outcome, and automatic retry remains forbidden because the provider
+    write may already have succeeded.
 
     ## Transport limits
 
@@ -87,9 +85,10 @@ paths:
               schema:
                 $ref: '#/components/schemas/CommentPage'
         '400':
-          $ref: '#/components/responses/ValidationError'
+          $ref: '#/components/responses/RetrievalBadRequest'
         '404':
-          description: The post is unknown.
+          description: |
+            The local post is unknown, or the provider reports that its resource no longer exists.
           content:
             application/json:
               schema:
@@ -101,6 +100,12 @@ paths:
                       code: POST_NOT_FOUND
                       message: Post was not found
                       requestId: 019fc3be-5155-7b43-aee4-63f580c05676
+                providerResourceNotFound:
+                  value:
+                    error:
+                      code: PLATFORM_RESOURCE_NOT_FOUND
+                      message: Platform resource was not found
+                      requestId: 019fc3be-5155-7b43-aee4-63f580c05676
         '422':
           $ref: '#/components/responses/UnsupportedPlatform'
         '429':
@@ -111,6 +116,8 @@ paths:
           $ref: '#/components/responses/PlatformAuthenticationFailed'
         '503':
           $ref: '#/components/responses/PlatformUnavailable'
+        '504':
+          $ref: '#/components/responses/PlatformTimeout'
 
   /comments/{commentId}/replies:
     get:
@@ -132,7 +139,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/CommentPage'
         '400':
-          $ref: '#/components/responses/ValidationError'
+          $ref: '#/components/responses/RetrievalBadRequest'
         '404':
           $ref: '#/components/responses/CommentNotFound'
         '422':
@@ -145,6 +152,8 @@ paths:
           $ref: '#/components/responses/PlatformAuthenticationFailed'
         '503':
           $ref: '#/components/responses/PlatformUnavailable'
+        '504':
+          $ref: '#/components/responses/PlatformTimeout'
 
   /comments:
     post:
@@ -242,8 +251,9 @@ paths:
         '502':
           description: |
             The provider rejected authentication, or the outcome of the publication could not be
-            determined. An indeterminate outcome persists nothing and is never retried
-            automatically, because the write may already have succeeded on the provider.
+            determined. An indeterminate outcome stores no comment, persists the publication
+            operation as indeterminate, and is never retried automatically because the write may
+            already have succeeded on the provider.
           content:
             application/json:
               schema:
@@ -263,6 +273,8 @@ paths:
                       requestId: 019fc3be-5155-7b43-aee4-63f580c05676
         '503':
           $ref: '#/components/responses/PlatformUnavailable'
+        '504':
+          $ref: '#/components/responses/PlatformTimeout'
 
 components:
   parameters:
@@ -294,7 +306,8 @@ components:
         Opaque continuation token taken from the `nextCursor` of a previous page. It is never
         interpreted, decoded, or rewritten by the API and must be sent back exactly as received.
         Omit it or send an empty value to request the first page. Clients should only send cursors
-        returned by the API; behavior of arbitrary non-empty values is adapter-specific.
+        returned by the API. A token that the selected provider adapter did not issue is rejected
+        with `400 PLATFORM_CURSOR_INVALID`; it is never treated as an empty final page.
       schema:
         type: string
         maxLength: 4096
@@ -430,8 +443,14 @@ components:
             - UNSUPPORTED_PLATFORM
             - IDEMPOTENCY_CONFLICT
             - PLATFORM_AUTHENTICATION_FAILED
+            - PLATFORM_PERMISSION_DENIED
+            - PLATFORM_RESOURCE_NOT_FOUND
+            - PLATFORM_VALIDATION_FAILED
             - PLATFORM_RATE_LIMITED
+            - PLATFORM_TIMEOUT
             - PLATFORM_UNAVAILABLE
+            - PLATFORM_OPERATION_UNSUPPORTED
+            - PLATFORM_CURSOR_INVALID
             - INDETERMINATE_PLATFORM_RESULT
             - INTERNAL_ERROR
         message:
@@ -484,9 +503,17 @@ components:
                   code: COMMENT_NOT_FOUND
                   message: Comment was not found
                   requestId: 019fc3be-5155-7b43-aee4-63f580c05676
+            providerResourceNotFound:
+              value:
+                error:
+                  code: PLATFORM_RESOURCE_NOT_FOUND
+                  message: Platform resource was not found
+                  requestId: 019fc3be-5155-7b43-aee4-63f580c05676
 
     UnsupportedPlatform:
-      description: No adapter is registered for the platform that owns this resource.
+      description: |
+        No adapter is registered for the platform, the registered provider does not support this
+        operation, or the provider rejects the request as invalid.
       content:
         application/json:
           schema:
@@ -526,6 +553,12 @@ components:
                   code: PLATFORM_AUTHENTICATION_FAILED
                   message: Platform authentication failed
                   requestId: 019fc3be-5155-7b43-aee4-63f580c05676
+            permissionDenied:
+              value:
+                error:
+                  code: PLATFORM_PERMISSION_DENIED
+                  message: Platform permission was denied
+                  requestId: 019fc3be-5155-7b43-aee4-63f580c05676
 
     PlatformUnavailable:
       description: The social platform is unavailable.
@@ -539,6 +572,20 @@ components:
                 error:
                   code: PLATFORM_UNAVAILABLE
                   message: Platform is unavailable
+                  requestId: 019fc3be-5155-7b43-aee4-63f580c05676
+
+    PlatformTimeout:
+      description: The social platform did not answer before the adapter deadline.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          examples:
+            timeout:
+              value:
+                error:
+                  code: PLATFORM_TIMEOUT
+                  message: Platform request timed out
                   requestId: 019fc3be-5155-7b43-aee4-63f580c05676
 
     InternalError:

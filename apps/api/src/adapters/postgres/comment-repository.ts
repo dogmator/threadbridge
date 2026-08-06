@@ -4,6 +4,7 @@ import {
     toExternalCommentId,
     toIdempotencyKey,
     toPostId,
+    type AccountId,
     type Comment,
     type CommentRepository,
     type IdempotencyKey,
@@ -29,6 +30,10 @@ interface CommentRow {
     readonly platform_data: PlatformMetadata | null;
 }
 
+interface AccountRow {
+    readonly account_id: string;
+}
+
 const toComment = (row: CommentRow): Comment => ({
     id: toCommentId(row.id),
     postId: toPostId(row.post_id),
@@ -49,12 +54,6 @@ const toComment = (row: CommentRow): Comment => ({
 export class PostgresCommentRepository implements CommentRepository {
     public constructor(private readonly sql: Sql) {}
 
-    /**
-     * Upserts on the external identity of a comment, so re-importing the same platform comment
-     * updates the existing projection instead of creating a duplicate. The internal identifier and
-     * the local creation timestamp survive a conflict; the version advances monotonically. The
-     * whole batch runs in one transaction and the results keep the order of the input.
-     */
     public async saveMany(comments: readonly NormalizedComment[]): Promise<readonly Comment[]> {
         if (comments.length === 0) {
             return [];
@@ -64,10 +63,7 @@ export class PostgresCommentRepository implements CommentRepository {
             const stored: Comment[] = [];
 
             for (const comment of comments) {
-                // Serialized once here and parsed by PostgreSQL: describing the parameter as text
-                // stops the driver from encoding an already encoded JSON document a second time.
-                const metadata =
-                    comment.metadata === null ? null : JSON.stringify(comment.metadata);
+                const metadata = comment.metadata === null ? null : JSON.stringify(comment.metadata);
                 const rows = await transaction<CommentRow[]>`
                     insert into comments (
                         post_id,
@@ -76,7 +72,10 @@ export class PostgresCommentRepository implements CommentRepository {
                         external_author_id,
                         content,
                         platform_created_at,
-                        platform_data
+                        platform_data,
+                        projection_state,
+                        last_observed_at,
+                        deleted_at
                     ) values (
                         ${comment.postId},
                         ${comment.parentCommentId},
@@ -84,7 +83,10 @@ export class PostgresCommentRepository implements CommentRepository {
                         ${comment.externalAuthorId},
                         ${comment.content},
                         ${comment.platformCreatedAt},
-                        ${metadata}::text::jsonb
+                        ${metadata}::text::jsonb,
+                        'active',
+                        now(),
+                        null
                     )
                     on conflict (post_id, external_comment_id) do update set
                         parent_comment_id = excluded.parent_comment_id,
@@ -92,6 +94,9 @@ export class PostgresCommentRepository implements CommentRepository {
                         content = excluded.content,
                         platform_created_at = excluded.platform_created_at,
                         platform_data = excluded.platform_data,
+                        projection_state = 'active',
+                        last_observed_at = now(),
+                        deleted_at = null,
                         updated_at = now(),
                         version = comments.version + 1
                     returning *
@@ -109,38 +114,50 @@ export class PostgresCommentRepository implements CommentRepository {
         });
     }
 
-    public async findByIdempotencyKey(idempotencyKey: IdempotencyKey): Promise<Comment | null> {
+    public async findByIdempotencyKey(
+        accountId: AccountId,
+        idempotencyKey: IdempotencyKey,
+    ): Promise<Comment | null> {
         const rows = await this.sql<CommentRow[]>`
-            select * from comments where idempotency_key = ${idempotencyKey}
+            select comments.*
+            from comments
+            join posts on posts.id = comments.post_id
+            where posts.account_id = ${accountId}
+              and comments.idempotency_key = ${idempotencyKey}
+            order by comments.created_at
+            limit 1
         `;
         const row = rows.at(0);
 
         return row === undefined ? null : toComment(row);
     }
 
-    /**
-     * A short transaction, opened only after the platform call has already returned.
-     *
-     * Publications sharing an idempotency key are serialized by a transaction-scoped advisory lock
-     * derived from that key, so the key is claimed exactly once even when the platform answers two
-     * concurrent requests with different external comment identifiers. A hash collision merely
-     * serializes unrelated keys; it cannot affect the outcome. Whoever loses the race re-reads the
-     * winning row and reports it as existing, which keeps a unique-constraint violation from ever
-     * reaching the caller.
-     */
     public async savePublishedReply(reply: PublishedReply): Promise<SavePublishedReplyResult> {
         const metadata = reply.metadata === null ? null : JSON.stringify(reply.metadata);
 
         return await this.sql.begin<SavePublishedReplyResult>(
             async (transaction): Promise<SavePublishedReplyResult> => {
+                const accountRows = await transaction<AccountRow[]>`
+                    select account_id from posts where id = ${reply.postId}
+                `;
+                const account = accountRows.at(0);
+
+                if (account === undefined) {
+                    throw new Error('Publishing a reply could not resolve the post account.');
+                }
+
                 await transaction`
                     select pg_advisory_xact_lock(
-                        hashtextextended(${reply.idempotencyKey}::text, 0)
+                        hashtextextended(${`${account.account_id}:${reply.idempotencyKey}`}::text, 0)
                     )
                 `;
 
                 const claimed = await transaction<CommentRow[]>`
-                    select * from comments where idempotency_key = ${reply.idempotencyKey}
+                    select comments.*
+                    from comments
+                    join posts on posts.id = comments.post_id
+                    where posts.account_id = ${account.account_id}
+                      and comments.idempotency_key = ${reply.idempotencyKey}
                 `;
                 const alreadyPublished = claimed.at(0);
 
@@ -157,7 +174,10 @@ export class PostgresCommentRepository implements CommentRepository {
                         content,
                         platform_created_at,
                         platform_data,
-                        idempotency_key
+                        idempotency_key,
+                        projection_state,
+                        last_observed_at,
+                        deleted_at
                     ) values (
                         ${reply.postId},
                         ${reply.parentCommentId},
@@ -166,7 +186,10 @@ export class PostgresCommentRepository implements CommentRepository {
                         ${reply.content},
                         ${reply.platformCreatedAt},
                         ${metadata}::text::jsonb,
-                        ${reply.idempotencyKey}
+                        ${reply.idempotencyKey},
+                        'active',
+                        now(),
+                        null
                     )
                     on conflict (post_id, external_comment_id) do nothing
                     returning *
@@ -177,11 +200,13 @@ export class PostgresCommentRepository implements CommentRepository {
                     return {kind: 'created', comment: toComment(created)};
                 }
 
-                // The same platform comment was already projected locally. Adopt the key only when
-                // the row carries none: a different recorded key is never replaced.
                 const reconciled = await transaction<CommentRow[]>`
                     update comments
-                    set idempotency_key = ${reply.idempotencyKey}, updated_at = now()
+                    set idempotency_key = ${reply.idempotencyKey},
+                        projection_state = 'active',
+                        last_observed_at = now(),
+                        deleted_at = null,
+                        updated_at = now()
                     where post_id = ${reply.postId}
                       and external_comment_id = ${reply.externalCommentId}
                       and idempotency_key is null
