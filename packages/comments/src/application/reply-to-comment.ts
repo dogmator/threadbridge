@@ -44,23 +44,82 @@ type FailedPublicationStatus = Extract<
     'retryable_failed' | 'failed' | 'indeterminate'
 >;
 
+interface OperationHandle {
+    readonly id: string;
+    readonly repository: ReplyPublicationOperationRepository;
+}
+
 const statusOf = (
     failure: PlatformFailure | IndeterminatePlatformResultFailure,
 ): FailedPublicationStatus => {
     switch (failure.code) {
         case 'INDETERMINATE_PLATFORM_RESULT':
-  return 'indeterminate';
+            return 'indeterminate';
         case 'PLATFORM_RATE_LIMITED':
         case 'PLATFORM_TIMEOUT':
         case 'PLATFORM_UNAVAILABLE':
-  return 'retryable_failed';
+            return 'retryable_failed';
         case 'PLATFORM_AUTHENTICATION_FAILED':
         case 'PLATFORM_PERMISSION_DENIED':
         case 'PLATFORM_RESOURCE_NOT_FOUND':
         case 'PLATFORM_VALIDATION_FAILED':
         case 'PLATFORM_OPERATION_UNSUPPORTED':
         case 'PLATFORM_CURSOR_INVALID':
-  return 'failed';
+            return 'failed';
+    }
+};
+
+const conflict = (
+    idempotencyKey: IdempotencyKey,
+): Result<ReplyToCommentSuccess, ReplyToCommentFailure> =>
+    err<ReplyToCommentFailure>({code: 'IDEMPOTENCY_CONFLICT', idempotencyKey});
+
+const indeterminate = (
+    platform: SocialPlatform,
+): Result<ReplyToCommentSuccess, ReplyToCommentFailure> =>
+    err<ReplyToCommentFailure>({code: 'INDETERMINATE_PLATFORM_RESULT', platform});
+
+const isReplayOf = (comment: Comment, query: ReplyToCommentQuery): boolean =>
+    comment.idempotencyKey === query.idempotencyKey
+    && comment.parentCommentId === query.parentCommentId
+    && comment.content === query.content;
+
+const replayOf = (
+    comment: Comment,
+    query: ReplyToCommentQuery,
+): Result<ReplyToCommentSuccess, ReplyToCommentFailure> =>
+    isReplayOf(comment, query)
+        ? ok<ReplyToCommentSuccess>({kind: 'existing', comment})
+        : conflict(query.idempotencyKey);
+
+const terminalFailureOf = (
+    code: ReplyPublicationFailureCode | null,
+): Result<ReplyToCommentSuccess, ReplyToCommentFailure> => {
+    switch (code) {
+        case 'PLATFORM_AUTHENTICATION_FAILED':
+        case 'PLATFORM_PERMISSION_DENIED':
+        case 'PLATFORM_RESOURCE_NOT_FOUND':
+        case 'PLATFORM_VALIDATION_FAILED':
+        case 'PLATFORM_OPERATION_UNSUPPORTED':
+        case 'PLATFORM_CURSOR_INVALID':
+            return err<ReplyToCommentFailure>({code});
+        case null:
+        case 'PLATFORM_RATE_LIMITED':
+        case 'PLATFORM_TIMEOUT':
+        case 'PLATFORM_UNAVAILABLE':
+        case 'IDEMPOTENCY_CONFLICT':
+        case 'INDETERMINATE_PLATFORM_RESULT':
+            throw new Error('A terminally failed operation has an invalid failure code.');
+    }
+};
+
+const markFailed = async (
+    operation: OperationHandle | null,
+    status: FailedPublicationStatus,
+    code: ReplyPublicationFailureCode,
+): Promise<void> => {
+    if (operation !== null) {
+        await operation.repository.markFailed(operation.id, status, code);
     }
 };
 
@@ -94,26 +153,28 @@ export class ReplyToComment {
             });
         }
 
-        if (this.operations === null) {
+        const operations = this.operations;
+
+        if (operations === null) {
             return await this.executeLegacy(query, context, gateway);
         }
 
-        const requestFingerprint = JSON.stringify([query.parentCommentId, query.content]);
-        const begun = await this.operations.begin({
+        const begun = await operations.begin({
             accountId: context.accountId,
             parentCommentId: query.parentCommentId,
             idempotencyKey: query.idempotencyKey,
-            requestFingerprint,
+            requestFingerprint: JSON.stringify([query.parentCommentId, query.content]),
         });
 
         if (begun.kind === 'conflict') {
-            return err<ReplyToCommentFailure>({
-                code: 'IDEMPOTENCY_CONFLICT',
-                idempotencyKey: query.idempotencyKey,
-            });
+            return conflict(query.idempotencyKey);
         }
 
         const operation = begun.operation;
+        const handle: OperationHandle = {
+            id: operation.id,
+            repository: operations,
+        };
 
         if (begun.kind === 'existing') {
             if (operation.status === 'published') {
@@ -121,55 +182,39 @@ export class ReplyToComment {
                     throw new Error('A published operation has no stored comment.');
                 }
 
-                return this.replayOf(operation.comment, query);
+                return replayOf(operation.comment, query);
             }
 
-            const recovered = await this.recoverStoredReply(query, context, operation);
+            const recovered = await this.recoverStoredReply(query, context, handle);
 
             if (recovered !== null) {
                 return recovered;
             }
 
             if (operation.status === 'indeterminate') {
-                return err<ReplyToCommentFailure>({
-                    code: 'INDETERMINATE_PLATFORM_RESULT',
-                    platform: context.platform,
-                });
+                return indeterminate(context.platform);
             }
 
             if (operation.status === 'failed') {
-                return this.replayTerminalFailure(operation.lastFailureCode);
+                return terminalFailureOf(operation.lastFailureCode);
             }
         }
 
-        // Capability changes affect only a new external attempt. A completed or locally
-        // recoverable operation above is replayed without consulting the provider.
         if (!gateway.capabilities.replyPublication) {
-            await this.operations.markFailed(
-                operation.id,
-                'failed',
-                'PLATFORM_OPERATION_UNSUPPORTED',
-            );
-
+            await markFailed(handle, 'failed', 'PLATFORM_OPERATION_UNSUPPORTED');
             return err<ReplyToCommentFailure>({code: 'PLATFORM_OPERATION_UNSUPPORTED'});
         }
 
-        if (begun.kind === 'existing'
+        if (
+            begun.kind === 'existing'
             && operation.status === 'pending'
-            && gateway.capabilities.publicationIdempotency === 'none') {
-            await this.operations.markFailed(
-                operation.id,
-                'indeterminate',
-                'INDETERMINATE_PLATFORM_RESULT',
-            );
-
-            return err<ReplyToCommentFailure>({
-                code: 'INDETERMINATE_PLATFORM_RESULT',
-                platform: context.platform,
-            });
+            && gateway.capabilities.publicationIdempotency === 'none'
+        ) {
+            await markFailed(handle, 'indeterminate', 'INDETERMINATE_PLATFORM_RESULT');
+            return indeterminate(context.platform);
         }
 
-        return await this.publishAndRecord(query, context, gateway, operation.id);
+        return await this.publishAndRecord(query, context, gateway, handle);
     }
 
     private async executeLegacy(
@@ -177,13 +222,13 @@ export class ReplyToComment {
         context: CommentReplyContext,
         gateway: SocialCommentsGateway,
     ): Promise<Result<ReplyToCommentSuccess, ReplyToCommentFailure>> {
-        const alreadyPublished = await this.comments.findByIdempotencyKey(
+        const existing = await this.comments.findByIdempotencyKey(
             context.accountId,
             query.idempotencyKey,
         );
 
-        if (alreadyPublished !== null) {
-            return this.replayOf(alreadyPublished, query);
+        if (existing !== null) {
+            return replayOf(existing, query);
         }
 
         if (!gateway.capabilities.replyPublication) {
@@ -196,35 +241,25 @@ export class ReplyToComment {
     private async recoverStoredReply(
         query: ReplyToCommentQuery,
         context: CommentReplyContext,
-        operation: ReplyPublicationOperation,
+        operation: OperationHandle,
     ): Promise<Result<ReplyToCommentSuccess, ReplyToCommentFailure> | null> {
-        if (this.operations === null) {
-  return null;
-        }
-
         const stored = await this.comments.findByIdempotencyKey(
-  context.accountId,
-  query.idempotencyKey,
+            context.accountId,
+            query.idempotencyKey,
         );
 
         if (stored === null) {
-  return null;
+            return null;
         }
 
-        const replay = this.replayOf(stored, query);
+        const replay = replayOf(stored, query);
 
         if (!replay.ok) {
-  await this.operations.markFailed(
-      operation.id,
-      'indeterminate',
-      'IDEMPOTENCY_CONFLICT',
-  );
-
-  return replay;
+            await markFailed(operation, 'indeterminate', 'IDEMPOTENCY_CONFLICT');
+            return replay;
         }
 
-        await this.operations.markPublished(operation.id, stored.id);
-
+        await operation.repository.markPublished(operation.id, stored.id);
         return replay;
     }
 
@@ -232,104 +267,48 @@ export class ReplyToComment {
         query: ReplyToCommentQuery,
         context: CommentReplyContext,
         gateway: SocialCommentsGateway,
-        operationId: string | null,
+        operation: OperationHandle | null,
     ): Promise<Result<ReplyToCommentSuccess, ReplyToCommentFailure>> {
         const published = await gateway.replyToComment({
-  accountId: context.accountId,
-  externalParentCommentId: context.externalParentCommentId,
-  content: query.content,
-  idempotencyKey: query.idempotencyKey,
+            accountId: context.accountId,
+            externalParentCommentId: context.externalParentCommentId,
+            content: query.content,
+            idempotencyKey: query.idempotencyKey,
         });
 
         if (!published.ok) {
-  if (published.error.code === 'PLATFORM_RESOURCE_NOT_FOUND'
-      && this.projectionStates !== null) {
-      await this.projectionStates.markDeleted(query.parentCommentId);
-  }
+            if (
+                published.error.code === 'PLATFORM_RESOURCE_NOT_FOUND'
+                && this.projectionStates !== null
+            ) {
+                await this.projectionStates.markDeleted(query.parentCommentId);
+            }
 
-  if (operationId !== null && this.operations !== null) {
-      await this.operations.markFailed(
-          operationId,
-          statusOf(published.error),
-          published.error.code,
-      );
-  }
-
-  return err<ReplyToCommentFailure>(published.error);
+            await markFailed(operation, statusOf(published.error), published.error.code);
+            return err<ReplyToCommentFailure>(published.error);
         }
 
         const reply: PublishedReply = {
-  postId: context.postId,
-  parentCommentId: query.parentCommentId,
-  externalCommentId: published.value.externalCommentId,
-  externalAuthorId: published.value.externalAuthorId,
-  content: published.value.content,
-  platformCreatedAt: published.value.createdAt,
-  metadata: published.value.metadata,
-  idempotencyKey: query.idempotencyKey,
+            postId: context.postId,
+            parentCommentId: query.parentCommentId,
+            externalCommentId: published.value.externalCommentId,
+            externalAuthorId: published.value.externalAuthorId,
+            content: published.value.content,
+            platformCreatedAt: published.value.createdAt,
+            metadata: published.value.metadata,
+            idempotencyKey: query.idempotencyKey,
         };
         const stored = await this.comments.savePublishedReply(reply);
 
-        if (!this.isReplayOf(stored.comment, query)) {
-  if (operationId !== null && this.operations !== null) {
-      await this.operations.markFailed(
-          operationId,
-          'indeterminate',
-          'IDEMPOTENCY_CONFLICT',
-      );
-  }
-
-  return err<ReplyToCommentFailure>({
-      code: 'IDEMPOTENCY_CONFLICT',
-      idempotencyKey: query.idempotencyKey,
-  });
+        if (!isReplayOf(stored.comment, query)) {
+            await markFailed(operation, 'indeterminate', 'IDEMPOTENCY_CONFLICT');
+            return conflict(query.idempotencyKey);
         }
 
-        if (operationId !== null && this.operations !== null) {
-  await this.operations.markPublished(operationId, stored.comment.id);
+        if (operation !== null) {
+            await operation.repository.markPublished(operation.id, stored.comment.id);
         }
 
         return ok<ReplyToCommentSuccess>(stored);
-    }
-
-    private replayTerminalFailure(
-        code: ReplyPublicationFailureCode | null,
-    ): Result<ReplyToCommentSuccess, ReplyToCommentFailure> {
-        switch (code) {
-  case 'PLATFORM_AUTHENTICATION_FAILED':
-  case 'PLATFORM_PERMISSION_DENIED':
-  case 'PLATFORM_RESOURCE_NOT_FOUND':
-  case 'PLATFORM_VALIDATION_FAILED':
-  case 'PLATFORM_OPERATION_UNSUPPORTED':
-  case 'PLATFORM_CURSOR_INVALID':
-      return err<ReplyToCommentFailure>({code});
-  case null:
-  case 'PLATFORM_RATE_LIMITED':
-  case 'PLATFORM_TIMEOUT':
-  case 'PLATFORM_UNAVAILABLE':
-  case 'IDEMPOTENCY_CONFLICT':
-  case 'INDETERMINATE_PLATFORM_RESULT':
-      throw new Error('A terminally failed operation has an invalid failure code.');
-        }
-    }
-
-    private replayOf(
-        comment: Comment,
-        query: ReplyToCommentQuery,
-    ): Result<ReplyToCommentSuccess, ReplyToCommentFailure> {
-        if (!this.isReplayOf(comment, query)) {
-  return err<ReplyToCommentFailure>({
-      code: 'IDEMPOTENCY_CONFLICT',
-      idempotencyKey: query.idempotencyKey,
-  });
-        }
-
-        return ok<ReplyToCommentSuccess>({kind: 'existing', comment});
-    }
-
-    private isReplayOf(comment: Comment, query: ReplyToCommentQuery): boolean {
-        return comment.idempotencyKey === query.idempotencyKey
-  && comment.parentCommentId === query.parentCommentId
-  && comment.content === query.content;
     }
 }
