@@ -10,7 +10,6 @@ import type {
 import type {CommentId, IdempotencyKey, SocialPlatform} from '../domain/identifiers.js';
 import type {
     ReplyPublicationFailureCode,
-    ReplyPublicationOperation,
     ReplyPublicationStatus,
 } from '../domain/reply-publication-operation.js';
 import {err, ok, type Result} from '../domain/result.js';
