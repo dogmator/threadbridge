@@ -47,7 +47,6 @@ relevant code and tests.
 | Relevant TypeScript code | Strict TypeScript workspace under `apps/` and `packages/`, gated by `npm run check` | The whole suite runs inside the same gate |
 | Major design decisions | [`docs/architecture.md`](./docs/architecture.md) and [`SPECIFICATION.md`](./SPECIFICATION.md) | — |
 | Assumptions | [Assumptions and trade-offs](#assumptions-and-trade-offs) and `SPECIFICATION.md` | — |
-| AI-usage disclosure | [AI-assisted development](#ai-assisted-development) | — |
 
 ### Supporting another platform
 
@@ -327,12 +326,6 @@ Dockerfile            Local/demo API image
 compose.yaml          Local API and PostgreSQL stack
 SPECIFICATION.md      Behavioral and architectural contract
 ```
-
-## AI-assisted development
-
-AI tools assisted with architectural review, test design, implementation feedback, and
-documentation refinement. All generated output was reviewed, adapted, and validated by the
-project author, who owns the final design and code.
 
 ## Documentation
 
