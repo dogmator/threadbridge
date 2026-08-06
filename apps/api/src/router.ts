@@ -4,11 +4,11 @@ import {
     toCursor,
     toIdempotencyKey,
     toPostId,
+    type CommentPage,
     type CommentsFailure,
     type Cursor,
-    type GetCommentRepliesQuery,
-    type GetPostCommentsQuery,
     type ReplyToCommentQuery,
+    type Result,
 } from '@threadbridge/comments';
 import {
     toCommentPageResponse,
@@ -59,54 +59,25 @@ const writeFailure = (
     writeJson(response, mapped.status, mapped.body, mapped.headers);
 };
 
-/**
- * Transport-local: the specification lists a validation error category, but a malformed request is
- * a transport concern and never becomes a core failure.
- */
-const writeValidationError = (
-    response: ServerResponse,
-    dependencies: ApiServerDependencies,
-): void => {
-    writeJson(
-        response,
-        400,
-        toErrorEnvelope(
-            'VALIDATION_ERROR',
-            'Request validation failed',
-            dependencies.requestIdFactory(),
-        ),
-    );
-};
+const TRANSPORT_ERRORS = {
+    validation: [400, 'VALIDATION_ERROR', 'Request validation failed'],
+    unsupportedMediaType: [415, 'UNSUPPORTED_MEDIA_TYPE', 'Content type must be application/json'],
+    payloadTooLarge: [413, 'PAYLOAD_TOO_LARGE', 'Request body is too large'],
+    routeNotFound: [404, 'ROUTE_NOT_FOUND', 'Route was not found'],
+    internal: [500, 'INTERNAL_ERROR', 'Internal error'],
+} as const;
 
-/** Transport-local: the request never reached a use case, so this is not a core failure. */
-const writeUnsupportedMediaType = (
-    response: ServerResponse,
-    dependencies: ApiServerDependencies,
-): void => {
-    writeJson(
-        response,
-        415,
-        toErrorEnvelope(
-            'UNSUPPORTED_MEDIA_TYPE',
-            'Content type must be application/json',
-            dependencies.requestIdFactory(),
-        ),
-    );
-};
+type TransportError = (typeof TRANSPORT_ERRORS)[keyof typeof TRANSPORT_ERRORS];
 
-/** Transport-local, for the same reason. */
-const writePayloadTooLarge = (
+const writeTransportError = (
     response: ServerResponse,
     dependencies: ApiServerDependencies,
+    [statusCode, code, message]: TransportError,
 ): void => {
     writeJson(
         response,
-        413,
-        toErrorEnvelope(
-            'PAYLOAD_TOO_LARGE',
-            'Request body is too large',
-            dependencies.requestIdFactory(),
-        ),
+        statusCode,
+        toErrorEnvelope(code, message, dependencies.requestIdFactory()),
     );
 };
 
@@ -201,7 +172,7 @@ const publishReply = async (
 ): Promise<void> => {
     if (!isJsonMediaType(request.headers['content-type'])) {
         makeConnectionNonReusable(request, response);
-        writeUnsupportedMediaType(response, dependencies);
+        writeTransportError(response, dependencies, TRANSPORT_ERRORS.unsupportedMediaType);
         return;
     }
 
@@ -209,14 +180,14 @@ const publishReply = async (
 
     if (body.kind === 'too-large') {
         makeConnectionNonReusable(request, response);
-        writePayloadTooLarge(response, dependencies);
+        writeTransportError(response, dependencies, TRANSPORT_ERRORS.payloadTooLarge);
         return;
     }
 
     const query = parseReplyRequest(body.text, request.headers['idempotency-key']);
 
     if (query === null) {
-        writeValidationError(response, dependencies);
+        writeTransportError(response, dependencies, TRANSPORT_ERRORS.validation);
         return;
     }
 
@@ -257,59 +228,31 @@ const readCursor = (url: URL): CursorSelection => {
     return {kind: 'cursor', cursor: toCursor(raw)};
 };
 
-const respondWithPostComments = async (
+type CommentPageLoader = (
+    rawId: string,
+    cursor: Cursor | null,
+) => Promise<Result<CommentPage, CommentsFailure>>;
+
+const respondWithCommentPage = async (
     response: ServerResponse,
     dependencies: ApiServerDependencies,
-    rawPostId: string,
+    rawId: string,
     url: URL,
+    load: CommentPageLoader,
 ): Promise<void> => {
-    if (!UUID_PATTERN.test(rawPostId)) {
-        writeValidationError(response, dependencies);
+    if (!UUID_PATTERN.test(rawId)) {
+        writeTransportError(response, dependencies, TRANSPORT_ERRORS.validation);
         return;
     }
 
     const cursor = readCursor(url);
 
     if (cursor.kind === 'too-long') {
-        writeValidationError(response, dependencies);
+        writeTransportError(response, dependencies, TRANSPORT_ERRORS.validation);
         return;
     }
 
-    const postId = toPostId(rawPostId);
-    const query: GetPostCommentsQuery =
-        cursor.kind === 'none' ? {postId} : {postId, cursor: cursor.cursor};
-    const result = await dependencies.getPostComments.execute(query);
-
-    if (!result.ok) {
-        writeFailure(response, result.error, dependencies);
-        return;
-    }
-
-    writeJson(response, 200, toCommentPageResponse(result.value));
-};
-
-const respondWithCommentReplies = async (
-    response: ServerResponse,
-    dependencies: ApiServerDependencies,
-    rawCommentId: string,
-    url: URL,
-): Promise<void> => {
-    if (!UUID_PATTERN.test(rawCommentId)) {
-        writeValidationError(response, dependencies);
-        return;
-    }
-
-    const cursor = readCursor(url);
-
-    if (cursor.kind === 'too-long') {
-        writeValidationError(response, dependencies);
-        return;
-    }
-
-    const commentId = toCommentId(rawCommentId);
-    const query: GetCommentRepliesQuery =
-        cursor.kind === 'none' ? {commentId} : {commentId, cursor: cursor.cursor};
-    const result = await dependencies.getCommentReplies.execute(query);
+    const result = await load(rawId, cursor.kind === 'none' ? null : cursor.cursor);
 
     if (!result.ok) {
         writeFailure(response, result.error, dependencies);
@@ -334,12 +277,34 @@ const route = async (
     }
 
     if (isGet && segments.length === 3 && segments[0] === 'posts' && segments[2] === 'comments') {
-        await respondWithPostComments(response, dependencies, segments[1] ?? '', url);
+        await respondWithCommentPage(
+            response,
+            dependencies,
+            segments[1] ?? '',
+            url,
+            async (rawId, cursor) => {
+                const postId = toPostId(rawId);
+                return await dependencies.getPostComments.execute(
+                    cursor === null ? {postId} : {postId, cursor},
+                );
+            },
+        );
         return;
     }
 
     if (isGet && segments.length === 3 && segments[0] === 'comments' && segments[2] === 'replies') {
-        await respondWithCommentReplies(response, dependencies, segments[1] ?? '', url);
+        await respondWithCommentPage(
+            response,
+            dependencies,
+            segments[1] ?? '',
+            url,
+            async (rawId, cursor) => {
+                const commentId = toCommentId(rawId);
+                return await dependencies.getCommentReplies.execute(
+                    cursor === null ? {commentId} : {commentId, cursor},
+                );
+            },
+        );
         return;
     }
 
@@ -348,11 +313,7 @@ const route = async (
         return;
     }
 
-    writeJson(
-        response,
-        404,
-        toErrorEnvelope('ROUTE_NOT_FOUND', 'Route was not found', dependencies.requestIdFactory()),
-    );
+    writeTransportError(response, dependencies, TRANSPORT_ERRORS.routeNotFound);
 };
 
 /**
@@ -368,15 +329,7 @@ export const handleRequest = async (
         await route(request, response, dependencies);
     } catch {
         if (!response.headersSent) {
-            writeJson(
-                response,
-                500,
-                toErrorEnvelope(
-                    'INTERNAL_ERROR',
-                    'Internal error',
-                    dependencies.requestIdFactory(),
-                ),
-            );
+            writeTransportError(response, dependencies, TRANSPORT_ERRORS.internal);
         }
     }
 };
