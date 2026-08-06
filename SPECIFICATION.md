@@ -9,7 +9,7 @@ and reviews enforce.
 ThreadBridge retrieves comments for published posts, publishes replies, supports multiple social
 platforms through a common application-facing contract, and exposes those capabilities through a
 REST API. The repository also contains the schema, API design, TypeScript implementation, design
-rationale, project assumptions, and AI-use disclosure for the service.
+rationale and project assumptions for the service.
 
 PostgreSQL, UUID v7 identifiers, cursor-based pagination, direct-reply retrieval, publication
 idempotency keys, optimistic-locking versions, checksum-verified migrations, transport limits, and
@@ -522,11 +522,3 @@ The architecture may later be extended with:
 - comment revision history.
 
 These are extension points, not current implementation requirements.
-
-## 16. AI-assisted development disclosure
-
-AI tools assisted with architectural review, test design, implementation feedback, and
-documentation refinement.
-
-All generated output was reviewed, adapted, and validated by the project author. Architectural
-decisions, final code ownership, and responsibility for the result remain with the author.
