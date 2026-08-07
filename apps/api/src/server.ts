@@ -14,9 +14,15 @@ export interface ApiServerDependencies {
 export class ApiServer extends EventEmitter {
     public constructor(private readonly fastify: FastifyInstance) {
         super();
-        fastify.server.on('listening', (): void => this.emit('listening'));
-        fastify.server.on('close', (): void => this.emit('close'));
-        fastify.server.on('error', (error: Error): void => this.emit('error', error));
+        fastify.server.on('listening', (): void => {
+            this.emit('listening');
+        });
+        fastify.server.on('close', (): void => {
+            this.emit('close');
+        });
+        fastify.server.on('error', (error: Error): void => {
+            this.emit('error', error);
+        });
     }
 
     public listen(port: number, host: string = '0.0.0.0'): this {

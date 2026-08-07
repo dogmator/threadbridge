@@ -1,11 +1,15 @@
 import type {IncomingMessage, ServerResponse} from 'node:http';
 import {
     Type,
-    TypeBoxTypeProvider,
     TypeBoxValidatorCompiler,
+    type TypeBoxTypeProvider,
 } from '@fastify/type-provider-typebox';
-import Fastify, {type FastifyError, type FastifyInstance, type FastifyReply, type FastifyRequest}
-    from 'fastify';
+import Fastify, {
+    type FastifyError,
+    type FastifyInstance,
+    type FastifyReply,
+    type FastifyRequest,
+} from 'fastify';
 import {
     toCommentId,
     toCursor,
@@ -150,6 +154,9 @@ const respondWithCommentPage = async (
         : sendFailure(reply, result.error, dependencies);
 };
 
+const isValidationError = (error: FastifyError): boolean =>
+    error.validation !== undefined || error.code === 'FST_ERR_CTP_INVALID_JSON_BODY';
+
 export const createHttpRouter = (dependencies: ApiServerDependencies): FastifyInstance => {
     const server = Fastify({
         bodyLimit: MAX_REQUEST_BODY_BYTES,
@@ -182,7 +189,7 @@ export const createHttpRouter = (dependencies: ApiServerDependencies): FastifyIn
         sendTransportError(
             reply,
             dependencies,
-            error.validation === undefined ? TRANSPORT_ERRORS.internal : TRANSPORT_ERRORS.validation,
+            isValidationError(error) ? TRANSPORT_ERRORS.validation : TRANSPORT_ERRORS.internal,
         );
     });
 
@@ -228,13 +235,13 @@ export const createHttpRouter = (dependencies: ApiServerDependencies): FastifyIn
     server.post(
         '/comments',
         {
-            onRequest: async (request, reply): Promise<void> => {
+            onRequest: async (request, reply): Promise<FastifyReply | void> => {
                 if (isJsonMediaType(request.headers['content-type'])) {
                     return;
                 }
 
                 makeConnectionNonReusable(request.raw, reply.raw);
-                sendTransportError(reply, dependencies, TRANSPORT_ERRORS.unsupportedMediaType);
+                return sendTransportError(reply, dependencies, TRANSPORT_ERRORS.unsupportedMediaType);
             },
             schema: {body: ReplyBodySchema},
         },
