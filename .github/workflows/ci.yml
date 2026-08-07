@@ -44,22 +44,9 @@ jobs:
           test "$(node --version)" = "v24.18.1"
           test "$(npm --version)" = "11.16.0"
 
-      - name: Prepare runtime security update
+      - name: Refresh runtime lock metadata
         if: github.event_name == 'push' && github.ref == 'refs/heads/refactor/publication-flow-clarity'
-        run: |
-          npm install --package-lock-only --ignore-scripts
-          python <<'PY'
-          from pathlib import Path
-
-          path = Path('.github/workflows/ci.yml')
-          workflow = path.read_text()
-          prepare_start = workflow.index('      - name: Prepare runtime security update\n')
-          install_start = workflow.index('      - name: Install dependencies\n', prepare_start)
-          finalize_start = workflow.index('      - name: Finalize runtime security update\n', install_start)
-          workflow = workflow[:prepare_start] + workflow[install_start:finalize_start]
-          workflow = workflow.replace('permissions:\n  contents: write', 'permissions:\n  contents: read')
-          path.write_text(workflow.rstrip() + '\n')
-          PY
+        run: npm install --package-lock-only --ignore-scripts
 
       - name: Install dependencies
         run: npm ci --ignore-scripts
@@ -138,25 +125,30 @@ jobs:
           printf '%s\n' "$runtime_logs" | grep -Fq '"route":"<unmatched>"'
           ! printf '%s\n' "$runtime_logs" | grep -Fq "$log_secret"
 
-          docker stop --time 10 threadbridge-runtime
+          docker stop --timeout 10 threadbridge-runtime
           test "$(docker inspect --format '{{.State.ExitCode}}' threadbridge-runtime)" = "0"
           docker rm threadbridge-runtime
           trap - EXIT
 
-      - name: Verify build leaves only security metadata changes
+      - name: Verify build leaves only lock metadata changes
         if: github.event_name == 'push' && github.ref == 'refs/heads/refactor/publication-flow-clarity'
         run: |
           mapfile -t changed < <(git status --porcelain --untracked-files=all | cut -c4-)
-          test "${#changed[@]}" -eq 2
-          test "${changed[0]}" = ".github/workflows/ci.yml"
-          test "${changed[1]}" = "package-lock.json"
+          test "${#changed[@]}" -le 1
+          if test "${#changed[@]}" -eq 1; then
+            test "${changed[0]}" = "package-lock.json"
+          fi
 
-      - name: Finalize runtime security update
+      - name: Publish refreshed runtime lock
         if: github.event_name == 'push' && github.ref == 'refs/heads/refactor/publication-flow-clarity'
         run: |
+          if git diff --quiet -- package-lock.json; then
+            exit 0
+          fi
+
           git config user.name dogmator
           git config user.email dogmatum@gmail.com
-          git add package-lock.json .github/workflows/ci.yml
+          git add package-lock.json
           git diff --cached --check
           git commit -m "build: refresh runtime security lock"
           git push origin HEAD:refactor/publication-flow-clarity
