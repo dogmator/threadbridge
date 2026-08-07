@@ -102,14 +102,16 @@ jobs:
 
       - name: Smoke production image
         run: |
+          container_database_url='postgresql://threadbridge:threadbridge@host.docker.internal:5432/threadbridge'
           docker run --detach \
             --name threadbridge-runtime \
-            --network host \
+            --add-host host.docker.internal:host-gateway \
+            --publish 3101:3101 \
             --read-only \
             --tmpfs /tmp:rw,noexec,nosuid,size=16m \
             --cap-drop ALL \
             --security-opt no-new-privileges=true \
-            --env DATABASE_URL="$DATABASE_URL" \
+            --env DATABASE_URL="$container_database_url" \
             --env API_PORT=3101 \
             threadbridge:ci
           trap 'docker rm --force threadbridge-runtime >/dev/null 2>&1 || true' EXIT
