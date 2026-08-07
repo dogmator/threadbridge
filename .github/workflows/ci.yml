@@ -104,6 +104,15 @@ jobs:
           done
 
           test "$ready" -eq 1
+
+          log_secret='threadbridge-ci-query-secret'
+          node -e "fetch('http://127.0.0.1:3101/unknown?marker=${log_secret}').then((response) => process.exit(response.status === 404 ? 0 : 1)).catch(() => process.exit(1))"
+          sleep 0.1
+          runtime_logs="$(docker logs threadbridge-runtime 2>&1)"
+          printf '%s\n' "$runtime_logs" | grep -Fq '"statusCode":404'
+          printf '%s\n' "$runtime_logs" | grep -Fq '"route":"<unmatched>"'
+          ! printf '%s\n' "$runtime_logs" | grep -Fq "$log_secret"
+
           docker stop --time 10 threadbridge-runtime
           test "$(docker inspect --format '{{.State.ExitCode}}' threadbridge-runtime)" = "0"
           docker rm threadbridge-runtime

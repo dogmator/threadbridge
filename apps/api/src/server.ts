@@ -12,6 +12,10 @@ export interface ApiServerDependencies {
     readonly replyToComment: ReplyToComment;
 }
 
+export interface ApiServerOptions {
+    readonly logger: boolean;
+}
+
 export class ApiServer extends EventEmitter {
     public constructor(private readonly fastify: FastifyInstance) {
         super();
@@ -55,5 +59,9 @@ export class ApiServer extends EventEmitter {
     }
 }
 
-export const createApiServer = (dependencies: ApiServerDependencies): ApiServer =>
-    new ApiServer(createHttpRouter(dependencies));
+const DEFAULT_SERVER_OPTIONS: ApiServerOptions = {logger: false};
+
+export const createApiServer = (
+    dependencies: ApiServerDependencies,
+    options: ApiServerOptions = DEFAULT_SERVER_OPTIONS,
+): ApiServer => new ApiServer(createHttpRouter(dependencies, options));

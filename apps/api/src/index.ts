@@ -5,7 +5,7 @@ import {createGracefulShutdown, SHUTDOWN_GRACE_PERIOD_MS} from './shutdown.js';
 
 const config = loadApiConfig(process.env);
 const components = createApiComponents(config.databaseUrl);
-const server = createApiServer(components.dependencies);
+const server = createApiServer(components.dependencies, {logger: true});
 
 server.listen(config.port);
 

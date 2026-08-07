@@ -23,7 +23,7 @@ import {
 } from '@threadbridge/comments';
 import {toCommentPageResponse, toCommentResponse} from './comment-response.js';
 import {toErrorEnvelope, toHttpErrorResponse} from './http-error.js';
-import type {ApiServerDependencies} from './server.js';
+import type {ApiServerDependencies, ApiServerOptions} from './server.js';
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 export const MAX_REQUEST_BODY_BYTES = 64 * 1024;
@@ -33,6 +33,8 @@ const MAX_CURSOR_CHARACTERS = 4_096;
 const REQUEST_RECEIVE_TIMEOUT_MS = 30_000;
 const JSON_MEDIA_TYPE = 'application/json';
 const JSON_CONTENT_TYPE = 'application/json; charset=utf-8';
+const UNMATCHED_ROUTE = '<unmatched>';
+const QUIET_ROUTES = new Set(['/health', '/ready']);
 
 const TRANSPORT_ERRORS = {
     validation: [400, 'VALIDATION_ERROR', 'Request validation failed'],
@@ -157,12 +159,16 @@ const respondWithCommentPage = async (
 const isValidationError = (error: FastifyError): boolean =>
     error.validation !== undefined || error.code === 'FST_ERR_CTP_INVALID_JSON_BODY';
 
-export const createHttpRouter = (dependencies: ApiServerDependencies): FastifyInstance => {
+export const createHttpRouter = (
+    dependencies: ApiServerDependencies,
+    options: ApiServerOptions,
+): FastifyInstance => {
     const server = Fastify({
         bodyLimit: MAX_REQUEST_BODY_BYTES,
         exposeHeadRoutes: false,
         genReqId: (): string => dependencies.requestIdFactory(),
-        logger: false,
+        logger: options.logger ? {level: 'info'} : false,
+        logController: {disableRequestLogging: true},
         requestIdHeader: false,
         requestTimeout: REQUEST_RECEIVE_TIMEOUT_MS,
         routerOptions: {
@@ -172,6 +178,27 @@ export const createHttpRouter = (dependencies: ApiServerDependencies): FastifyIn
     })
         .withTypeProvider<TypeBoxTypeProvider>()
         .setValidatorCompiler(TypeBoxValidatorCompiler);
+
+    if (options.logger) {
+        server.addHook('onResponse', (request, reply, done): void => {
+            const route = request.routeOptions.url ?? UNMATCHED_ROUTE;
+
+            if (!QUIET_ROUTES.has(route)) {
+                request.log.info(
+                    {
+                        requestId: request.id,
+                        method: request.method,
+                        route,
+                        statusCode: reply.statusCode,
+                        durationMs: reply.elapsedTime,
+                    },
+                    'HTTP request completed',
+                );
+            }
+
+            done();
+        });
+    }
 
     server.removeContentTypeParser('application/json');
     server.addContentTypeParser(
@@ -191,6 +218,13 @@ export const createHttpRouter = (dependencies: ApiServerDependencies): FastifyIn
             return;
         }
 
+        if (!isValidationError(error)) {
+            request.log.error(
+                {requestId: request.id, errorName: error.name},
+                'Unexpected request failure',
+            );
+        }
+
         sendTransportError(
             reply,
             request.id,
@@ -206,11 +240,15 @@ export const createHttpRouter = (dependencies: ApiServerDependencies): FastifyIn
         sendJson(reply, 200, {status: 'ok'});
     });
 
-    server.get('/ready', async (_request, reply): Promise<FastifyReply> => {
+    server.get('/ready', async (request, reply): Promise<FastifyReply> => {
         try {
             await dependencies.checkReadiness();
             return await sendJson(reply, 200, {status: 'ready'});
         } catch {
+            request.log.warn(
+                {requestId: request.id, route: '/ready'},
+                'Readiness check failed',
+            );
             return await sendJson(reply, 503, {status: 'unavailable'});
         }
     });
