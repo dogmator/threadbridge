@@ -5,7 +5,7 @@ on:
   pull_request:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   check:
@@ -43,10 +43,6 @@ jobs:
         run: |
           test "$(node --version)" = "v24.18.1"
           test "$(npm --version)" = "11.16.0"
-
-      - name: Refresh runtime lock metadata
-        if: github.event_name == 'push' && github.ref == 'refs/heads/refactor/publication-flow-clarity'
-        run: npm install --package-lock-only --ignore-scripts
 
       - name: Install dependencies
         run: npm ci --ignore-scripts
@@ -130,25 +126,5 @@ jobs:
           docker rm threadbridge-runtime
           trap - EXIT
 
-      - name: Verify build leaves only lock metadata changes
-        if: github.event_name == 'push' && github.ref == 'refs/heads/refactor/publication-flow-clarity'
-        run: |
-          mapfile -t changed < <(git status --porcelain --untracked-files=all | cut -c4-)
-          test "${#changed[@]}" -le 1
-          if test "${#changed[@]}" -eq 1; then
-            test "${changed[0]}" = "package-lock.json"
-          fi
-
-      - name: Publish refreshed runtime lock
-        if: github.event_name == 'push' && github.ref == 'refs/heads/refactor/publication-flow-clarity'
-        run: |
-          if git diff --quiet -- package-lock.json; then
-            exit 0
-          fi
-
-          git config user.name dogmator
-          git config user.email dogmatum@gmail.com
-          git add package-lock.json
-          git diff --cached --check
-          git commit -m "build: refresh runtime security lock"
-          git push origin HEAD:refactor/publication-flow-clarity
+      - name: Verify build leaves repository clean
+        run: test -z "$(git status --porcelain --untracked-files=all)"
