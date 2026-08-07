@@ -4,6 +4,8 @@ const MAXIMUM_TCP_PORT = 65_535;
 const DECIMAL_INTEGER_PATTERN = /^[1-9]\d*$/u;
 const INVALID_API_PORT_MESSAGE = 'API_PORT must be an integer between 1 and 65535.';
 
+export const DATABASE_CONNECT_TIMEOUT_SECONDS = 5;
+
 export interface ApiConfig {
     readonly databaseUrl: string;
     readonly port: number;
