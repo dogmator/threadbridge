@@ -6,7 +6,11 @@
   "exports": {
     ".": {
       "types": "./src/index.ts",
+      "production": "./dist/index.js",
       "default": "./src/index.ts"
     }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json"
   }
 }

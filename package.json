@@ -13,6 +13,7 @@
     "packages/*"
   ],
   "scripts": {
+    "build": "npm run build --workspace @threadbridge/comments && npm run build --workspace @threadbridge/api",
     "typecheck": "tsc --noEmit",
     "lint": "eslint . --max-warnings=0",
     "lint:fix": "eslint . --fix --max-warnings=0",

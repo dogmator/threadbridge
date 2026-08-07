@@ -44,3 +44,30 @@ jobs:
 
       - name: Run checks
         run: npm run check
+
+      - name: Build production artifacts
+        run: npm run build
+
+      - name: Smoke compiled runtime
+        run: |
+          node --conditions=production apps/api/dist/migrate.js
+          API_PORT=3100 node --conditions=production apps/api/dist/index.js &
+          api_pid=$!
+          trap 'kill -TERM "$api_pid" 2>/dev/null || true' EXIT
+
+          ready=0
+          for attempt in $(seq 1 20); do
+            if node -e "fetch('http://127.0.0.1:3100/ready').then((response) => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))"; then
+              ready=1
+              break
+            fi
+            sleep 0.25
+          done
+
+          test "$ready" -eq 1
+          kill -TERM "$api_pid"
+          wait "$api_pid"
+          trap - EXIT
+
+      - name: Verify build leaves repository clean
+        run: test -z "$(git status --porcelain --untracked-files=all)"
