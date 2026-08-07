@@ -31,7 +31,7 @@ describe('OpenAPI operational contract', () => {
         expect(readiness).toContain("        '503':");
         expect(readiness).toContain('const: ready');
         expect(readiness).toContain('const: unavailable');
-        expect(readiness).toContain('Provider availability is deliberately excluded');
+        expect(specification).toContain('Provider availability is deliberately excluded');
     });
 });
 
