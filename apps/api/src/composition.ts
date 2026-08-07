@@ -47,6 +47,9 @@ export const createApiComponents = (databaseUrl: string): ApiComponents => {
     return {
         dependencies: {
             requestIdFactory: randomUUID,
+            checkReadiness: async (): Promise<void> => {
+                await sql`select 1`;
+            },
             getPostComments: new GetPostComments(publishedPosts, gateways, comments),
             getCommentReplies: new GetCommentReplies(replyContexts, gateways, comments),
             // This adapter owns both active reply-context reads and explicit

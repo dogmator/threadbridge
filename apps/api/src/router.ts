@@ -204,6 +204,15 @@ export const createHttpRouter = (dependencies: ApiServerDependencies): FastifyIn
         sendJson(reply, 200, {status: 'ok'});
     });
 
+    server.get('/ready', async (_request, reply): Promise<FastifyReply> => {
+        try {
+            await dependencies.checkReadiness();
+            return await sendJson(reply, 200, {status: 'ready'});
+        } catch {
+            return await sendJson(reply, 503, {status: 'unavailable'});
+        }
+    });
+
     server.get('/posts/:postId/comments', {schema: {params: PostParamsSchema}}, async (request, reply) =>
         await respondWithCommentPage(
             request,

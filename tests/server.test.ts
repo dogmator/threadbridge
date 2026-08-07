@@ -37,6 +37,7 @@ const noComments: CommentRepository = {
 
 const dependenciesWith = (requestIdFactory: () => string): ApiServerDependencies => ({
     requestIdFactory,
+    checkReadiness: (): Promise<void> => Promise.resolve(),
     getPostComments: new GetPostComments(noPosts, noGateways, noComments),
     getCommentReplies: new GetCommentReplies(noReplyContexts, noGateways, noComments),
     replyToComment: new ReplyToComment(noReplyContexts, noGateways, noComments),
@@ -59,9 +60,17 @@ const failingReplyContexts: CommentReplyContextRepository = {findByCommentId: le
 
 const failingDependenciesWith = (requestIdFactory: () => string): ApiServerDependencies => ({
     requestIdFactory,
+    checkReadiness: (): Promise<void> => Promise.resolve(),
     getPostComments: new GetPostComments(failingPosts, noGateways, noComments),
     getCommentReplies: new GetCommentReplies(failingReplyContexts, noGateways, noComments),
     replyToComment: new ReplyToComment(failingReplyContexts, noGateways, noComments),
+});
+
+const unavailableDependenciesWith = (requestIdFactory: () => string): ApiServerDependencies => ({
+    ...dependenciesWith(requestIdFactory),
+    checkReadiness: (): Promise<void> => Promise.reject(
+        new Error('postgresql://threadbridge:hunter2@db:5432/threadbridge is unavailable'),
+    ),
 });
 
 class CountingRequestIdFactory {
@@ -125,6 +134,50 @@ describe('API server', () => {
 
             expect(await response.json()).toEqual({status: 'ok'});
         });
+    });
+
+    it('keeps liveness independent from PostgreSQL readiness', async () => {
+        await withApiServer(
+            async (baseUrl): Promise<void> => {
+                const response = await fetch(`${baseUrl}/health`);
+
+                expect(response.status).toBe(200);
+                expect(await response.json()).toEqual({status: 'ok'});
+            },
+            randomUUID,
+            unavailableDependenciesWith,
+        );
+    });
+
+    it('answers GET /ready with status 200 when PostgreSQL is reachable', async () => {
+        await withApiServer(async (baseUrl): Promise<void> => {
+            const response = await fetch(`${baseUrl}/ready`);
+
+            expect(response.status).toBe(200);
+            expect(await response.json()).toEqual({status: 'ready'});
+        });
+    });
+
+    it('answers GET /ready with a safe 503 when PostgreSQL is unavailable', async () => {
+        const requestIds = new CountingRequestIdFactory('request-1');
+
+        await withApiServer(
+            async (baseUrl): Promise<void> => {
+                const response = await fetch(`${baseUrl}/ready`);
+                const raw = await response.text();
+
+                expect(response.status).toBe(503);
+                expect(response.headers.get('content-type'))
+                    .toBe('application/json; charset=utf-8');
+                expect(JSON.parse(raw) as unknown).toEqual({status: 'unavailable'});
+                expect(raw).not.toContain('hunter2');
+                expect(raw).not.toContain('postgresql://');
+            },
+            requestIds.create,
+            unavailableDependenciesWith,
+        );
+
+        expect(requestIds.calls).toBe(1);
     });
 
     it('generates exactly one request identifier for a successful health request', async () => {

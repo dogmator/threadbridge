@@ -6,6 +6,7 @@ import {createHttpRouter} from './router.js';
 
 export interface ApiServerDependencies {
     readonly requestIdFactory: () => string;
+    readonly checkReadiness: () => Promise<void>;
     readonly getPostComments: GetPostComments;
     readonly getCommentReplies: GetCommentReplies;
     readonly replyToComment: ReplyToComment;
