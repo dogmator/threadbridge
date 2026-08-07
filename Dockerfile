@@ -1,4 +1,4 @@
-FROM node:24.15.0-alpine AS build
+FROM node:24.18.1-alpine AS build
 
 WORKDIR /app
 
@@ -14,7 +14,7 @@ COPY apps/api/src apps/api/src
 COPY packages/comments/src packages/comments/src
 RUN npm run build
 
-FROM node:24.15.0-alpine AS production-dependencies
+FROM node:24.18.1-alpine AS production-dependencies
 
 WORKDIR /app
 
@@ -24,7 +24,7 @@ COPY packages/comments/package.json packages/comments/package.json
 RUN npm ci --omit=dev --ignore-scripts \
     && npm cache clean --force
 
-FROM node:24.15.0-alpine AS runtime
+FROM node:24.18.1-alpine AS runtime
 
 ENV NODE_ENV=production
 WORKDIR /app
