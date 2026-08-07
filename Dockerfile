@@ -1,4 +1,4 @@
-FROM node:24.18.1-alpine@sha256:f70403e87646dc51b45295f4b8b70cdad0b63d2297c4c9899119b03f7af7a6b3 AS build
+FROM node:24.18.1-alpine@sha256:f70403e87646dc51b45295f4b8b70cdad0b63d2297c4c9899119b03f7af7a6b3 AS development-dependencies
 
 WORKDIR /app
 
@@ -7,12 +7,19 @@ COPY apps/api/package.json apps/api/package.json
 COPY packages/comments/package.json packages/comments/package.json
 RUN npm ci --ignore-scripts
 
+FROM development-dependencies AS build
+
 COPY tsconfig.json ./
 COPY apps/api/tsconfig.build.json apps/api/tsconfig.build.json
 COPY packages/comments/tsconfig.build.json packages/comments/tsconfig.build.json
 COPY apps/api/src apps/api/src
 COPY packages/comments/src packages/comments/src
 RUN npm run build
+
+FROM development-dependencies AS check
+
+COPY . .
+CMD ["npm", "run", "check"]
 
 FROM node:24.18.1-alpine@sha256:f70403e87646dc51b45295f4b8b70cdad0b63d2297c4c9899119b03f7af7a6b3 AS production-dependencies
 

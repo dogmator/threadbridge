@@ -53,6 +53,9 @@ jobs:
       - name: Run checks
         run: npm run check
 
+      - name: Verify local pre-commit gate
+        run: .githooks/pre-commit
+
       - name: Build production artifacts
         run: npm run build
 
