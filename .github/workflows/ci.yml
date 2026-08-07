@@ -39,8 +39,13 @@ jobs:
           node-version-file: .nvmrc
           cache: npm
 
-      - name: Install dependencies
-        run: npm ci
+      - name: Resolve dependencies
+        run: |
+          npm install
+          echo 'LOCKFILE_BASE64_BEGIN'
+          base64 -w0 package-lock.json
+          echo
+          echo 'LOCKFILE_BASE64_END'
 
       - name: Run checks
         run: npm run check

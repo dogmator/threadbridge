@@ -1,5 +1,12 @@
 import type {IncomingMessage, ServerResponse} from 'node:http';
 import {
+    Type,
+    TypeBoxTypeProvider,
+    TypeBoxValidatorCompiler,
+} from '@fastify/type-provider-typebox';
+import Fastify, {type FastifyError, type FastifyInstance, type FastifyReply, type FastifyRequest}
+    from 'fastify';
+import {
     toCommentId,
     toCursor,
     toIdempotencyKey,
@@ -10,54 +17,17 @@ import {
     type ReplyToCommentQuery,
     type Result,
 } from '@threadbridge/comments';
-import {
-    toCommentPageResponse,
-    toCommentResponse,
-    type CommentPageResponse,
-    type CommentResponse,
-} from './comment-response.js';
-import {toErrorEnvelope, toHttpErrorResponse, type HttpErrorEnvelope} from './http-error.js';
-import {readBoundedBody} from './request-body.js';
+import {toCommentPageResponse, toCommentResponse} from './comment-response.js';
+import {toErrorEnvelope, toHttpErrorResponse} from './http-error.js';
 import type {ApiServerDependencies} from './server.js';
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
-
-/**
- * Transport limits. They bound what an untrusted client can make this process hold or forward, and
- * they are deliberately checked here rather than in the core: a request that is too large or too
- * long is never a domain failure.
- */
+const MAX_REQUEST_BODY_BYTES = 64 * 1024;
 const MAX_IDEMPOTENCY_KEY_CHARACTERS = 200;
 const MAX_CONTENT_CHARACTERS = 10_000;
 const MAX_CURSOR_CHARACTERS = 4_096;
-
 const JSON_MEDIA_TYPE = 'application/json';
-
-const writeJson = (
-    response: ServerResponse,
-    statusCode: number,
-    body:
-        | Readonly<Record<string, string>>
-        | CommentPageResponse
-        | CommentResponse
-        | HttpErrorEnvelope,
-    headers: Readonly<Record<string, string>> = {},
-): void => {
-    response.writeHead(statusCode, {
-        ...headers,
-        'content-type': 'application/json; charset=utf-8',
-    }).end(JSON.stringify(body));
-};
-
-const writeFailure = (
-    response: ServerResponse,
-    failure: CommentsFailure,
-    dependencies: ApiServerDependencies,
-): void => {
-    const mapped = toHttpErrorResponse(failure, dependencies.requestIdFactory());
-
-    writeJson(response, mapped.status, mapped.body, mapped.headers);
-};
+const JSON_CONTENT_TYPE = 'application/json; charset=utf-8';
 
 const TRANSPORT_ERRORS = {
     validation: [400, 'VALIDATION_ERROR', 'Request validation failed'],
@@ -69,24 +39,33 @@ const TRANSPORT_ERRORS = {
 
 type TransportError = (typeof TRANSPORT_ERRORS)[keyof typeof TRANSPORT_ERRORS];
 
-const writeTransportError = (
-    response: ServerResponse,
+const sendJson = (
+    reply: FastifyReply,
+    statusCode: number,
+    body: unknown,
+    headers: Readonly<Record<string, string>> = {},
+): FastifyReply => reply.headers(headers).code(statusCode).type(JSON_CONTENT_TYPE).send(body);
+
+const sendFailure = (
+    reply: FastifyReply,
+    failure: CommentsFailure,
     dependencies: ApiServerDependencies,
-    [statusCode, code, message]: TransportError,
-): void => {
-    writeJson(
-        response,
-        statusCode,
-        toErrorEnvelope(code, message, dependencies.requestIdFactory()),
-    );
+): FastifyReply => {
+    const mapped = toHttpErrorResponse(failure, dependencies.requestIdFactory());
+
+    return sendJson(reply, mapped.status, mapped.body, mapped.headers);
 };
 
-/**
- * A response sent before the whole request body is read must not share its connection with a
- * subsequent request: the remaining bytes belong to this request's framing. The response is still
- * allowed to flush promptly; the stream is resumed only to discard those bytes until the socket
- * closes after this response.
- */
+const sendTransportError = (
+    reply: FastifyReply,
+    dependencies: ApiServerDependencies,
+    [statusCode, code, message]: TransportError,
+): FastifyReply => sendJson(
+    reply,
+    statusCode,
+    toErrorEnvelope(code, message, dependencies.requestIdFactory()),
+);
+
 const makeConnectionNonReusable = (request: IncomingMessage, response: ServerResponse): void => {
     response.shouldKeepAlive = false;
     response.setHeader('connection', 'close');
@@ -94,38 +73,23 @@ const makeConnectionNonReusable = (request: IncomingMessage, response: ServerRes
     request.resume();
 };
 
-/**
- * Accepts `application/json` with any parameters, such as a charset. Media types are
- * case-insensitive, and a missing header is not treated as a guess in favour of JSON.
- */
 const isJsonMediaType = (header: string | readonly string[] | undefined): boolean => {
     if (typeof header !== 'string') {
         return false;
     }
 
-    const mediaType = header.split(';')[0]?.trim().toLowerCase();
-
-    return mediaType === JSON_MEDIA_TYPE;
+    return header.split(';')[0]?.trim().toLowerCase() === JSON_MEDIA_TYPE;
 };
 
-const isRecord = (value: unknown): value is Readonly<Record<string, unknown>> =>
-    typeof value === 'object' && value !== null && !Array.isArray(value);
+const ReplyBodySchema = Type.Object(
+    {parentCommentId: Type.String(), content: Type.String()},
+    {additionalProperties: true},
+);
+const PostParamsSchema = Type.Object({postId: Type.String()});
+const CommentParamsSchema = Type.Object({commentId: Type.String()});
 
-const parseJson = (raw: string): unknown => {
-    try {
-        return JSON.parse(raw) as unknown;
-    } catch {
-        return undefined;
-    }
-};
-
-/**
- * Builds the publication query from untrusted input. Emptiness is judged on trimmed content and
- * the key is trimmed before it is measured, but the exact accepted content is never rewritten: it
- * is published and compared for idempotency exactly as it arrived.
- */
 const parseReplyRequest = (
-    raw: string,
+    body: {readonly parentCommentId: string; readonly content: string},
     idempotencyHeader: string | readonly string[] | undefined,
 ): ReplyToCommentQuery | null => {
     if (typeof idempotencyHeader !== 'string') {
@@ -138,94 +102,27 @@ const parseReplyRequest = (
         return null;
     }
 
-    const body = parseJson(raw);
-
-    if (!isRecord(body)) {
-        return null;
-    }
-
-    const {parentCommentId, content} = body;
-
-    if (typeof parentCommentId !== 'string' || !UUID_PATTERN.test(parentCommentId)) {
-        return null;
-    }
-
-    if (typeof content !== 'string' || content.trim() === '') {
-        return null;
-    }
-
-    if (content.length > MAX_CONTENT_CHARACTERS) {
+    if (!UUID_PATTERN.test(body.parentCommentId)
+        || body.content.trim() === ''
+        || body.content.length > MAX_CONTENT_CHARACTERS) {
         return null;
     }
 
     return {
-        parentCommentId: toCommentId(parentCommentId),
-        content,
+        parentCommentId: toCommentId(body.parentCommentId),
+        content: body.content,
         idempotencyKey: toIdempotencyKey(idempotencyKey),
     };
 };
 
-const publishReply = async (
-    request: IncomingMessage,
-    response: ServerResponse,
-    dependencies: ApiServerDependencies,
-): Promise<void> => {
-    if (!isJsonMediaType(request.headers['content-type'])) {
-        makeConnectionNonReusable(request, response);
-        writeTransportError(response, dependencies, TRANSPORT_ERRORS.unsupportedMediaType);
-        return;
-    }
-
-    const body = await readBoundedBody(request);
-
-    if (body.kind === 'too-large') {
-        makeConnectionNonReusable(request, response);
-        writeTransportError(response, dependencies, TRANSPORT_ERRORS.payloadTooLarge);
-        return;
-    }
-
-    const query = parseReplyRequest(body.text, request.headers['idempotency-key']);
-
-    if (query === null) {
-        writeTransportError(response, dependencies, TRANSPORT_ERRORS.validation);
-        return;
-    }
-
-    const result = await dependencies.replyToComment.execute(query);
-
-    if (!result.ok) {
-        writeFailure(response, result.error, dependencies);
-        return;
-    }
-
-    writeJson(
-        response,
-        result.value.kind === 'created' ? 201 : 200,
-        toCommentResponse(result.value.comment),
-    );
-};
-
-type CursorSelection =
-    | {readonly kind: 'none'}
-    | {readonly kind: 'cursor'; readonly cursor: Cursor}
-    | {readonly kind: 'too-long'};
-
-/**
- * A cursor stays opaque here: it is only measured, never decoded or rewritten, and it reaches the
- * adapter exactly as the client sent it.
- */
-const readCursor = (url: URL): CursorSelection => {
-    const raw = url.searchParams.get('cursor');
+const readCursor = (request: FastifyRequest): Cursor | null | undefined => {
+    const raw = new URL(request.raw.url ?? '/', 'http://127.0.0.1').searchParams.get('cursor');
 
     if (raw === null || raw === '') {
-        return {kind: 'none'};
+        return null;
     }
 
-    if (raw.length > MAX_CURSOR_CHARACTERS) {
-        return {kind: 'too-long'};
-    }
-
-    return {kind: 'cursor', cursor: toCursor(raw)};
+    return raw.length > MAX_CURSOR_CHARACTERS ? undefined : toCursor(raw);
 };
 
 type CommentPageLoader = (
@@ -234,102 +131,131 @@ type CommentPageLoader = (
 ) => Promise<Result<CommentPage, CommentsFailure>>;
 
 const respondWithCommentPage = async (
-    response: ServerResponse,
+    request: FastifyRequest,
+    reply: FastifyReply,
     dependencies: ApiServerDependencies,
     rawId: string,
-    url: URL,
     load: CommentPageLoader,
-): Promise<void> => {
-    if (!UUID_PATTERN.test(rawId)) {
-        writeTransportError(response, dependencies, TRANSPORT_ERRORS.validation);
-        return;
+): Promise<FastifyReply> => {
+    const cursor = readCursor(request);
+
+    if (!UUID_PATTERN.test(rawId) || cursor === undefined) {
+        return sendTransportError(reply, dependencies, TRANSPORT_ERRORS.validation);
     }
 
-    const cursor = readCursor(url);
+    const result = await load(rawId, cursor);
 
-    if (cursor.kind === 'too-long') {
-        writeTransportError(response, dependencies, TRANSPORT_ERRORS.validation);
-        return;
-    }
-
-    const result = await load(rawId, cursor.kind === 'none' ? null : cursor.cursor);
-
-    if (!result.ok) {
-        writeFailure(response, result.error, dependencies);
-        return;
-    }
-
-    writeJson(response, 200, toCommentPageResponse(result.value));
+    return result.ok
+        ? sendJson(reply, 200, toCommentPageResponse(result.value))
+        : sendFailure(reply, result.error, dependencies);
 };
 
-const route = async (
-    request: IncomingMessage,
-    response: ServerResponse,
-    dependencies: ApiServerDependencies,
-): Promise<void> => {
-    const url = new URL(request.url ?? '/', 'http://127.0.0.1');
-    const segments = url.pathname.split('/').filter((segment): boolean => segment !== '');
-    const isGet = request.method === 'GET';
+export const createHttpRouter = (dependencies: ApiServerDependencies): FastifyInstance => {
+    const server = Fastify({
+        bodyLimit: MAX_REQUEST_BODY_BYTES,
+        exposeHeadRoutes: false,
+        ignoreDuplicateSlashes: true,
+        ignoreTrailingSlash: true,
+        logger: false,
+    })
+        .withTypeProvider<TypeBoxTypeProvider>()
+        .setValidatorCompiler(TypeBoxValidatorCompiler);
 
-    if (isGet && segments.length === 1 && segments[0] === 'health') {
-        writeJson(response, 200, {status: 'ok'});
-        return;
-    }
+    server.removeContentTypeParser('application/json');
+    server.addContentTypeParser(
+        /^application\/json(?:\s*;.*)?$/iu,
+        {parseAs: 'string'},
+        server.getDefaultJsonParser('ignore', 'ignore'),
+    );
 
-    if (isGet && segments.length === 3 && segments[0] === 'posts' && segments[2] === 'comments') {
-        await respondWithCommentPage(
-            response,
+    server.setErrorHandler((error: FastifyError, request, reply): void => {
+        if (reply.sent) {
+            return;
+        }
+
+        if (error.code === 'FST_ERR_CTP_BODY_TOO_LARGE') {
+            makeConnectionNonReusable(request.raw, reply.raw);
+            sendTransportError(reply, dependencies, TRANSPORT_ERRORS.payloadTooLarge);
+            return;
+        }
+
+        sendTransportError(
+            reply,
             dependencies,
-            segments[1] ?? '',
-            url,
+            error.validation === undefined ? TRANSPORT_ERRORS.internal : TRANSPORT_ERRORS.validation,
+        );
+    });
+
+    server.setNotFoundHandler((_request, reply): void => {
+        sendTransportError(reply, dependencies, TRANSPORT_ERRORS.routeNotFound);
+    });
+
+    server.get('/health', (_request, reply): void => {
+        sendJson(reply, 200, {status: 'ok'});
+    });
+
+    server.get('/posts/:postId/comments', {schema: {params: PostParamsSchema}}, async (request, reply) =>
+        await respondWithCommentPage(
+            request,
+            reply,
+            dependencies,
+            request.params.postId,
             async (rawId, cursor) => {
                 const postId = toPostId(rawId);
                 return await dependencies.getPostComments.execute(
                     cursor === null ? {postId} : {postId, cursor},
                 );
             },
-        );
-        return;
-    }
+        ));
 
-    if (isGet && segments.length === 3 && segments[0] === 'comments' && segments[2] === 'replies') {
-        await respondWithCommentPage(
-            response,
+    server.get(
+        '/comments/:commentId/replies',
+        {schema: {params: CommentParamsSchema}},
+        async (request, reply) => await respondWithCommentPage(
+            request,
+            reply,
             dependencies,
-            segments[1] ?? '',
-            url,
+            request.params.commentId,
             async (rawId, cursor) => {
                 const commentId = toCommentId(rawId);
                 return await dependencies.getCommentReplies.execute(
                     cursor === null ? {commentId} : {commentId, cursor},
                 );
             },
-        );
-        return;
-    }
+        ),
+    );
 
-    if (request.method === 'POST' && segments.length === 1 && segments[0] === 'comments') {
-        await publishReply(request, response, dependencies);
-        return;
-    }
+    server.post(
+        '/comments',
+        {
+            onRequest: async (request, reply): Promise<void> => {
+                if (isJsonMediaType(request.headers['content-type'])) {
+                    return;
+                }
 
-    writeTransportError(response, dependencies, TRANSPORT_ERRORS.routeNotFound);
-};
+                makeConnectionNonReusable(request.raw, reply.raw);
+                sendTransportError(reply, dependencies, TRANSPORT_ERRORS.unsupportedMediaType);
+            },
+            schema: {body: ReplyBodySchema},
+        },
+        async (request, reply): Promise<FastifyReply> => {
+            const query = parseReplyRequest(request.body, request.headers['idempotency-key']);
 
-/**
- * Never rejects: an unexpected failure becomes a transport-local internal error, so one bad
- * request cannot take the process down or leave a connection hanging.
- */
-export const handleRequest = async (
-    request: IncomingMessage,
-    response: ServerResponse,
-    dependencies: ApiServerDependencies,
-): Promise<void> => {
-    try {
-        await route(request, response, dependencies);
-    } catch {
-        if (!response.headersSent) {
-            writeTransportError(response, dependencies, TRANSPORT_ERRORS.internal);
-        }
-    }
+            if (query === null) {
+                return sendTransportError(reply, dependencies, TRANSPORT_ERRORS.validation);
+            }
+
+            const result = await dependencies.replyToComment.execute(query);
+
+            return result.ok
+                ? sendJson(
+                    reply,
+                    result.value.kind === 'created' ? 201 : 200,
+                    toCommentResponse(result.value.comment),
+                )
+                : sendFailure(reply, result.error, dependencies);
+        },
+    );
+
+    return server;
 };
