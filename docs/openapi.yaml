@@ -46,7 +46,7 @@ servers:
 
 tags:
   - name: Health
-    description: Liveness of the service itself.
+    description: Liveness and PostgreSQL readiness of the service.
   - name: Comments
     description: Retrieval of comments and publication of replies.
 
@@ -64,6 +64,49 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HealthResponse'
+
+  /ready:
+    get:
+      tags: [Health]
+      summary: Readiness check
+      description: |
+        Reports whether PostgreSQL, the required local dependency for API operations, is reachable.
+        Provider availability is deliberately excluded: an external provider outage must not remove
+        an otherwise healthy API instance from service discovery or load-balancer rotation.
+      operationId: getReadiness
+      responses:
+        '200':
+          description: PostgreSQL is reachable and the service is ready to receive API traffic.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    const: ready
+              examples:
+                ready:
+                  value:
+                    status: ready
+        '503':
+          description: PostgreSQL is unavailable. No database error detail is exposed.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    const: unavailable
+              examples:
+                unavailable:
+                  value:
+                    status: unavailable
 
   /posts/{postId}/comments:
     get:
@@ -460,12 +503,14 @@ components:
             provider payloads, credentials, database details, or stack traces.
         requestId:
           type: string
-          description: Identifier generated for this error response, useful for correlation.
+          description: Identifier generated for the request, useful for correlation.
 
     ErrorEnvelope:
       type: object
       additionalProperties: false
-      description: The single error envelope used by every failing request.
+      description: |
+        The error envelope used by application and transport failures. Operational readiness uses
+        its probe-specific status body instead.
       required: [error]
       properties:
         error:

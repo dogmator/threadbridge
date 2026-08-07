@@ -23,6 +23,18 @@ beforeAll(async (): Promise<void> => {
     specification = await readFile(resolve(process.cwd(), 'docs/openapi.yaml'), 'utf8');
 });
 
+describe('OpenAPI operational contract', () => {
+    it('documents PostgreSQL readiness separately from liveness', () => {
+        const readiness = operationSection('getReadiness');
+
+        expect(readiness).toContain("        '200':");
+        expect(readiness).toContain("        '503':");
+        expect(readiness).toContain('const: ready');
+        expect(readiness).toContain('const: unavailable');
+        expect(readiness).toContain('Provider availability is deliberately excluded');
+    });
+});
+
 describe('OpenAPI platform failure contract', () => {
     it.each(['getPostComments', 'getCommentReplies', 'publishReply'])(
         'declares HTTP 504 for %s',
