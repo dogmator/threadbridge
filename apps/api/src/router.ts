@@ -26,7 +26,7 @@ import {toErrorEnvelope, toHttpErrorResponse} from './http-error.js';
 import type {ApiServerDependencies} from './server.js';
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
-const MAX_REQUEST_BODY_BYTES = 64 * 1024;
+export const MAX_REQUEST_BODY_BYTES = 64 * 1024;
 const MAX_IDEMPOTENCY_KEY_CHARACTERS = 200;
 const MAX_CONTENT_CHARACTERS = 10_000;
 const MAX_CURSOR_CHARACTERS = 4_096;
@@ -161,9 +161,11 @@ export const createHttpRouter = (dependencies: ApiServerDependencies): FastifyIn
     const server = Fastify({
         bodyLimit: MAX_REQUEST_BODY_BYTES,
         exposeHeadRoutes: false,
-        ignoreDuplicateSlashes: true,
-        ignoreTrailingSlash: true,
         logger: false,
+        routerOptions: {
+            ignoreDuplicateSlashes: true,
+            ignoreTrailingSlash: true,
+        },
     })
         .withTypeProvider<TypeBoxTypeProvider>()
         .setValidatorCompiler(TypeBoxValidatorCompiler);

@@ -5,7 +5,7 @@ on:
   pull_request:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   check:
@@ -42,87 +42,5 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Apply transport cleanup
-        if: github.event_name == 'push' && github.ref == 'refs/heads/refactor/publication-flow-clarity'
-        run: |
-          python <<'PY'
-          from pathlib import Path
-
-          router_path = Path('apps/api/src/router.ts')
-          router = router_path.read_text()
-          old_limit = 'const MAX_REQUEST_BODY_BYTES = 64 * 1024;'
-          assert router.count(old_limit) == 1
-          router = router.replace(old_limit, 'export const MAX_REQUEST_BODY_BYTES = 64 * 1024;')
-
-          old_options = "        ignoreDuplicateSlashes: true,\n        ignoreTrailingSlash: true,\n        logger: false,\n"
-          new_options = "        logger: false,\n        routerOptions: {\n            ignoreDuplicateSlashes: true,\n            ignoreTrailingSlash: true,\n        },\n"
-          assert router.count(old_options) == 1
-          router_path.write_text(router.replace(old_options, new_options))
-
-          test_path = Path('tests/http-limits.test.ts')
-          test = test_path.read_text()
-          test = test.replace("import {Readable} from 'node:stream';\n", '')
-          old_import = "import {MAX_REQUEST_BODY_BYTES, readBoundedBody} from '../apps/api/src/request-body.js';\n"
-          new_import = "import {MAX_REQUEST_BODY_BYTES} from '../apps/api/src/router.js';\n"
-          assert test.count(old_import) == 1
-          test = test.replace(old_import, new_import)
-
-          fake_start = test.index('/** A stream that reports whatever content length it likes')
-          fake_end = test.index('/** Writes an intentionally unfinished HTTP/1.1 request')
-          test = test[:fake_start] + test[fake_end:]
-
-          unit_start = test.index("describe('readBoundedBody'")
-          unit_end = test.index("describe('POST /comments media type'")
-          test = test[:unit_start] + test[unit_end:]
-
-          marker = "    it('rejects a declared length over the limit with 413', async () => {"
-          assert test.count(marker) == 1
-          utf8_test = """    it('measures the 64 KiB limit in UTF-8 bytes', async () => {
-              await withApiServer(async ({baseUrl, requestIds}): Promise<void> => {
-                  const body = replyBody('€'.repeat(22_000));
-
-                  expect(body.length).toBeLessThan(MAX_REQUEST_BODY_BYTES);
-                  expect(Buffer.byteLength(body, 'utf8')).toBeGreaterThan(MAX_REQUEST_BODY_BYTES);
-
-                  const response = await postRaw(
-                      baseUrl,
-                      {'content-type': 'application/json', 'idempotency-key': 'limits-key'},
-                      body,
-                  );
-                  const envelope = envelopeOf(response.body);
-
-                  expect(response.status).toBe(413);
-                  expect(envelope.error.code).toBe('PAYLOAD_TOO_LARGE');
-                  expect(requestIds.calls).toBe(1);
-              });
-          });
-
-          """
-          test_path.write_text(test.replace(marker, utf8_test + marker))
-
-          request_body_path = Path('apps/api/src/request-body.ts')
-          assert request_body_path.exists()
-          request_body_path.unlink()
-
-          workflow_path = Path('.github/workflows/ci.yml')
-          workflow = workflow_path.read_text()
-          apply_start = workflow.index('      - name: Apply transport cleanup\n')
-          run_checks_start = workflow.index('      - name: Run checks\n', apply_start)
-          commit_start = workflow.index('      - name: Commit transport cleanup\n', run_checks_start)
-          workflow = workflow[:apply_start] + workflow[run_checks_start:commit_start]
-          workflow = workflow.replace('permissions:\n  contents: write', 'permissions:\n  contents: read')
-          workflow_path.write_text(workflow.rstrip() + '\n')
-          PY
-
       - name: Run checks
         run: npm run check
-
-      - name: Commit transport cleanup
-        if: github.event_name == 'push' && github.ref == 'refs/heads/refactor/publication-flow-clarity'
-        run: |
-          git config user.name dogmator
-          git config user.email dogmatum@gmail.com
-          git add -A
-          git diff --cached --check
-          git commit -m "refactor: remove obsolete request body reader"
-          git push origin HEAD:refactor/publication-flow-clarity
