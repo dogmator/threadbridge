@@ -121,6 +121,7 @@ describe('runMigrations', () => {
                 '0003_comment_parent_post_consistency.sql',
                 '0004_provider_boundary_hardening.sql',
                 '0005_limited_demo_seed.sql',
+                '0006_publication_failure_code_invariant.sql',
             ]);
             expect(records.map((record): string => record.name)).toEqual([
                 '0001_initial_schema.sql',
@@ -128,6 +129,7 @@ describe('runMigrations', () => {
                 '0003_comment_parent_post_consistency.sql',
                 '0004_provider_boundary_hardening.sql',
                 '0005_limited_demo_seed.sql',
+                '0006_publication_failure_code_invariant.sql',
             ]);
             expect(records.every((record): boolean => record.checksum?.length === 64)).toBe(true);
         });

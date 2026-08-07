@@ -1,5 +1,9 @@
 import {resolve} from 'node:path';
-import {toCommentId} from '@threadbridge/comments';
+import {
+    toCommentId,
+    type ReplyPublicationFailureCode,
+    type ReplyPublicationStatus,
+} from '@threadbridge/comments';
 import postgres, {type Sql} from 'postgres';
 import {afterAll, beforeAll, describe, expect, it} from 'vitest';
 import {PostgresReplyPublicationOperationRepository}
@@ -16,6 +20,35 @@ const migrationsDirectory = resolve(process.cwd(), 'db/migrations');
 const admin = postgres(databaseUrl, {onnotice: (): void => undefined});
 const schema = `publication_invariants_${String(process.pid)}`;
 const prefix = `publication-invariant-${String(process.pid)}`;
+const allowedFailureCodesByStatus = {
+    pending: [],
+    published: [],
+    retryable_failed: [
+        'PLATFORM_RATE_LIMITED',
+        'PLATFORM_TIMEOUT',
+        'PLATFORM_UNAVAILABLE',
+    ],
+    failed: [
+        'PLATFORM_AUTHENTICATION_FAILED',
+        'PLATFORM_PERMISSION_DENIED',
+        'PLATFORM_RESOURCE_NOT_FOUND',
+        'PLATFORM_VALIDATION_FAILED',
+        'PLATFORM_OPERATION_UNSUPPORTED',
+        'PLATFORM_CURSOR_INVALID',
+    ],
+    indeterminate: ['INDETERMINATE_PLATFORM_RESULT', 'IDEMPOTENCY_CONFLICT'],
+} as const satisfies Readonly<
+    Record<ReplyPublicationStatus, readonly ReplyPublicationFailureCode[]>
+>;
+const publicationStatuses = Object.keys(allowedFailureCodesByStatus) as ReplyPublicationStatus[];
+const productionFailureCodes = [
+    ...allowedFailureCodesByStatus.retryable_failed,
+    ...allowedFailureCodesByStatus.failed,
+    ...allowedFailureCodesByStatus.indeterminate,
+] as const;
+type MappedFailureCode = (typeof productionFailureCodes)[number];
+const productionMappingIsExhaustive:
+    Exclude<ReplyPublicationFailureCode, MappedFailureCode> extends never ? true : false = true;
 
 interface IdRow {
     readonly id: string;
@@ -227,6 +260,55 @@ describe('reply publication operation database invariants', () => {
             set last_failure_code = 'PLATFORM_TIMEOUT'
             where id = ${unexpectedCodeId}
         `).rejects.toThrow(/reply_publication_operations_failure_check/u);
+    });
+
+    it('enforces every status and failure-code combination', async () => {
+        const publishedCommentId = await createReply('failure-code-matrix');
+        const codes = [null, ...productionFailureCodes] as const;
+        let validCount = 0;
+        let invalidCount = 0;
+        let combinationIndex = 0;
+
+        expect(productionMappingIsExhaustive).toBe(true);
+
+        for (const status of publicationStatuses) {
+            const allowedCodes: readonly ReplyPublicationFailureCode[] =
+                allowedFailureCodesByStatus[status];
+
+            for (const failureCode of codes) {
+                combinationIndex += 1;
+                const operationId = await createPendingOperation(
+                    `matrix-${String(combinationIndex)}`,
+                );
+                const transition = sql`
+                    update reply_publication_operations
+                    set status = ${status},
+                        comment_id = ${status === 'published' ? publishedCommentId : null},
+                        last_failure_code = ${failureCode}
+                    where id = ${operationId}
+                    returning status
+                `;
+                const isValid = failureCode === null
+                    ? allowedCodes.length === 0
+                    : allowedCodes.includes(failureCode);
+
+                if (isValid) {
+                    await expect(transition).resolves.toHaveLength(1);
+                    validCount += 1;
+                } else {
+                    const expectedConstraint = failureCode === null
+                        || status === 'pending'
+                        || status === 'published'
+                        ? /reply_publication_operations_failure_check/u
+                        : /reply_publication_operations_failure_code_check/u;
+
+                    await expect(transition).rejects.toThrow(expectedConstraint);
+                    invalidCount += 1;
+                }
+            }
+        }
+
+        expect({validCount, invalidCount}).toEqual({validCount: 13, invalidCount: 47});
     });
 
     it('rejects a published operation that references a missing comment', async () => {

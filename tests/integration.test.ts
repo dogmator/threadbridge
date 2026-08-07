@@ -152,6 +152,7 @@ describe('migrations', () => {
             '0003_comment_parent_post_consistency.sql',
             '0004_provider_boundary_hardening.sql',
             '0005_limited_demo_seed.sql',
+            '0006_publication_failure_code_invariant.sql',
         ]);
         expect(rows.every((row): boolean => row.checksum.length === 64)).toBe(true);
     });
