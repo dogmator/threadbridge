@@ -13,6 +13,7 @@ const infrastructureImports = [
 
 export default defineConfig(
     globalIgnores([
+        '.tmp/**',
         '**/node_modules/**',
         '**/dist/**',
         '**/coverage/**',
