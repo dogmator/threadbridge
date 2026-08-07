@@ -54,26 +54,10 @@ jobs:
           assert router.count(old_limit) == 1
           router = router.replace(old_limit, 'export const MAX_REQUEST_BODY_BYTES = 64 * 1024;')
 
-          old_fastify_options = """    const server = Fastify({
-              bodyLimit: MAX_REQUEST_BODY_BYTES,
-              exposeHeadRoutes: false,
-              ignoreDuplicateSlashes: true,
-              ignoreTrailingSlash: true,
-              logger: false,
-          })
-          """
-          new_fastify_options = """    const server = Fastify({
-              bodyLimit: MAX_REQUEST_BODY_BYTES,
-              exposeHeadRoutes: false,
-              logger: false,
-              routerOptions: {
-                  ignoreDuplicateSlashes: true,
-                  ignoreTrailingSlash: true,
-              },
-          })
-          """
-          assert router.count(old_fastify_options) == 1
-          router_path.write_text(router.replace(old_fastify_options, new_fastify_options))
+          old_options = "        ignoreDuplicateSlashes: true,\n        ignoreTrailingSlash: true,\n        logger: false,\n"
+          new_options = "        logger: false,\n        routerOptions: {\n            ignoreDuplicateSlashes: true,\n            ignoreTrailingSlash: true,\n        },\n"
+          assert router.count(old_options) == 1
+          router_path.write_text(router.replace(old_options, new_options))
 
           test_path = Path('tests/http-limits.test.ts')
           test = test_path.read_text()
