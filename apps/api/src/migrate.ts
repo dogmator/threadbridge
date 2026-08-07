@@ -9,6 +9,7 @@ const sql = postgres(databaseUrl, {
     connect_timeout: DATABASE_CONNECT_TIMEOUT_SECONDS,
     connection: {application_name: DATABASE_APPLICATION_NAME},
     max: 1,
+    onnotice: (): void => undefined,
 });
 
 try {
