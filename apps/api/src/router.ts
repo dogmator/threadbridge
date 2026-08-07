@@ -5,6 +5,7 @@ import {
     type TypeBoxTypeProvider,
 } from '@fastify/type-provider-typebox';
 import Fastify, {
+    LogController,
     type FastifyError,
     type FastifyInstance,
     type FastifyReply,
@@ -168,7 +169,7 @@ export const createHttpRouter = (
         exposeHeadRoutes: false,
         genReqId: (): string => dependencies.requestIdFactory(),
         logger: options.logger ? {level: 'info'} : false,
-        logController: {disableRequestLogging: true},
+        logController: new LogController({disableRequestLogging: true}),
         requestIdHeader: false,
         requestTimeout: REQUEST_RECEIVE_TIMEOUT_MS,
         routerOptions: {
