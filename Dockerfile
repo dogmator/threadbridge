@@ -46,5 +46,6 @@ COPY db/migrations ./db/migrations
 
 USER node
 EXPOSE 3000
+STOPSIGNAL SIGTERM
 
-CMD ["sh", "-c", "node --enable-source-maps --conditions=production apps/api/dist/migrate.js && exec node --enable-source-maps --conditions=production apps/api/dist/index.js"]
+CMD ["node", "--enable-source-maps", "--conditions=production", "apps/api/dist/index.js"]

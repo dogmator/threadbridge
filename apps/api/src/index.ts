@@ -1,9 +1,12 @@
 import {createApiComponents} from './composition.js';
 import {loadApiConfig} from './config.js';
+import {migrateDatabase} from './database-migrations.js';
 import {createApiServer} from './server.js';
 import {createGracefulShutdown, SHUTDOWN_GRACE_PERIOD_MS} from './shutdown.js';
 
 const config = loadApiConfig(process.env);
+await migrateDatabase(config.databaseUrl);
+
 const components = createApiComponents(config.databaseUrl);
 const server = createApiServer(components.dependencies, {logger: true});
 

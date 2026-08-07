@@ -86,6 +86,8 @@ jobs:
       - name: Verify production image contents
         run: |
           test "$(docker image inspect --format '{{.Config.User}}' threadbridge:ci)" = "node"
+          test "$(docker image inspect --format '{{.Config.StopSignal}}' threadbridge:ci)" = "SIGTERM"
+          test "$(docker image inspect --format '{{json .Config.Cmd}}' threadbridge:ci)" = '["node","--enable-source-maps","--conditions=production","apps/api/dist/index.js"]'
           docker run --rm --entrypoint sh threadbridge:ci -c '
             test ! -e node_modules/tsx
             test ! -e apps/api/src
@@ -100,6 +102,10 @@ jobs:
           docker run --detach \
             --name threadbridge-runtime \
             --network host \
+            --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+            --cap-drop ALL \
+            --security-opt no-new-privileges=true \
             --env DATABASE_URL="$DATABASE_URL" \
             --env API_PORT=3101 \
             threadbridge:ci
@@ -124,7 +130,7 @@ jobs:
           printf '%s\n' "$runtime_logs" | grep -Fq '"route":"<unmatched>"'
           ! printf '%s\n' "$runtime_logs" | grep -Fq "$log_secret"
 
-          docker stop --timeout 10 threadbridge-runtime
+          docker stop --timeout 15 threadbridge-runtime
           test "$(docker inspect --format '{{.State.ExitCode}}' threadbridge-runtime)" = "0"
           docker rm threadbridge-runtime
           trap - EXIT
