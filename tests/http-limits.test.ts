@@ -105,6 +105,7 @@ const withApiServer = async (use: (harness: Harness) => Promise<void>): Promise<
     const gateways = new Map<SocialPlatform, SocialCommentsGateway>([[demoPlatform, gateway]]);
     const dependencies: ApiServerDependencies = {
         requestIdFactory: requestIds.create,
+        checkReadiness: (): Promise<void> => Promise.resolve(),
         getPostComments: new GetPostComments(knownPost, gateways, noComments),
         getCommentReplies: new GetCommentReplies(noReplyContexts, gateways, noComments),
         replyToComment: new ReplyToComment(noReplyContexts, gateways, noComments),
@@ -317,24 +318,24 @@ describe('POST /comments body size', () => {
     });
 
     it('measures the 64 KiB limit in UTF-8 bytes', async () => {
-    await withApiServer(async ({baseUrl, requestIds}): Promise<void> => {
-        const body = replyBody('€'.repeat(22_000));
+        await withApiServer(async ({baseUrl, requestIds}): Promise<void> => {
+            const body = replyBody('€'.repeat(22_000));
 
-        expect(body.length).toBeLessThan(MAX_REQUEST_BODY_BYTES);
-        expect(Buffer.byteLength(body, 'utf8')).toBeGreaterThan(MAX_REQUEST_BODY_BYTES);
+            expect(body.length).toBeLessThan(MAX_REQUEST_BODY_BYTES);
+            expect(Buffer.byteLength(body, 'utf8')).toBeGreaterThan(MAX_REQUEST_BODY_BYTES);
 
-        const response = await postRaw(
-            baseUrl,
-            {'content-type': 'application/json', 'idempotency-key': 'limits-key'},
-            body,
-        );
-        const envelope = envelopeOf(response.body);
+            const response = await postRaw(
+                baseUrl,
+                {'content-type': 'application/json', 'idempotency-key': 'limits-key'},
+                body,
+            );
+            const envelope = envelopeOf(response.body);
 
-        expect(response.status).toBe(413);
-        expect(envelope.error.code).toBe('PAYLOAD_TOO_LARGE');
-        expect(requestIds.calls).toBe(1);
+            expect(response.status).toBe(413);
+            expect(envelope.error.code).toBe('PAYLOAD_TOO_LARGE');
+            expect(requestIds.calls).toBe(1);
+        });
     });
-});
 
     it('rejects a declared length over the limit with 413', async () => {
         await withApiServer(async ({baseUrl, requestIds}): Promise<void> => {

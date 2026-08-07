@@ -99,6 +99,7 @@ const gateways = new Map<SocialPlatform, SocialCommentsGateway>([
 describe('provider HTTP semantics', () => {
     const server = createApiServer({
         requestIdFactory: (): string => 'request-provider-semantics',
+        checkReadiness: (): Promise<void> => Promise.resolve(),
         getPostComments: new GetPostComments(posts, gateways, comments),
         getCommentReplies: new GetCommentReplies(contexts, gateways, comments),
         replyToComment: new ReplyToComment(contexts, gateways, comments),
