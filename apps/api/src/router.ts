@@ -144,14 +144,14 @@ const respondWithCommentPage = async (
     const cursor = readCursor(request);
 
     if (!UUID_PATTERN.test(rawId) || cursor === undefined) {
-        return sendTransportError(reply, dependencies, TRANSPORT_ERRORS.validation);
+        return await sendTransportError(reply, dependencies, TRANSPORT_ERRORS.validation);
     }
 
     const result = await load(rawId, cursor);
 
     return result.ok
-        ? sendJson(reply, 200, toCommentPageResponse(result.value))
-        : sendFailure(reply, result.error, dependencies);
+        ? await sendJson(reply, 200, toCommentPageResponse(result.value))
+        : await sendFailure(reply, result.error, dependencies);
 };
 
 const isValidationError = (error: FastifyError): boolean =>
@@ -235,13 +235,17 @@ export const createHttpRouter = (dependencies: ApiServerDependencies): FastifyIn
     server.post(
         '/comments',
         {
-            onRequest: async (request, reply): Promise<FastifyReply | void> => {
+            onRequest: async (request, reply): Promise<FastifyReply | undefined> => {
                 if (isJsonMediaType(request.headers['content-type'])) {
-                    return;
+                    return undefined;
                 }
 
                 makeConnectionNonReusable(request.raw, reply.raw);
-                return sendTransportError(reply, dependencies, TRANSPORT_ERRORS.unsupportedMediaType);
+                return await sendTransportError(
+                    reply,
+                    dependencies,
+                    TRANSPORT_ERRORS.unsupportedMediaType,
+                );
             },
             schema: {body: ReplyBodySchema},
         },
@@ -249,18 +253,18 @@ export const createHttpRouter = (dependencies: ApiServerDependencies): FastifyIn
             const query = parseReplyRequest(request.body, request.headers['idempotency-key']);
 
             if (query === null) {
-                return sendTransportError(reply, dependencies, TRANSPORT_ERRORS.validation);
+                return await sendTransportError(reply, dependencies, TRANSPORT_ERRORS.validation);
             }
 
             const result = await dependencies.replyToComment.execute(query);
 
             return result.ok
-                ? sendJson(
+                ? await sendJson(
                     reply,
                     result.value.kind === 'created' ? 201 : 200,
                     toCommentResponse(result.value.comment),
                 )
-                : sendFailure(reply, result.error, dependencies);
+                : await sendFailure(reply, result.error, dependencies);
         },
     );
 

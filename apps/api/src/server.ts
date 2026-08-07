@@ -25,7 +25,7 @@ export class ApiServer extends EventEmitter {
         });
     }
 
-    public listen(port: number, host: string = '0.0.0.0'): this {
+    public listen(port: number, host = '0.0.0.0'): this {
         void this.fastify.listen({port, host}).catch((error: unknown): void => {
             this.emit('error', error);
         });
