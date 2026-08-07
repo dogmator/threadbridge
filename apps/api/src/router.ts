@@ -30,6 +30,7 @@ export const MAX_REQUEST_BODY_BYTES = 64 * 1024;
 const MAX_IDEMPOTENCY_KEY_CHARACTERS = 200;
 const MAX_CONTENT_CHARACTERS = 10_000;
 const MAX_CURSOR_CHARACTERS = 4_096;
+const REQUEST_RECEIVE_TIMEOUT_MS = 30_000;
 const JSON_MEDIA_TYPE = 'application/json';
 const JSON_CONTENT_TYPE = 'application/json; charset=utf-8';
 
@@ -163,6 +164,7 @@ export const createHttpRouter = (dependencies: ApiServerDependencies): FastifyIn
         genReqId: (): string => dependencies.requestIdFactory(),
         logger: false,
         requestIdHeader: false,
+        requestTimeout: REQUEST_RECEIVE_TIMEOUT_MS,
         routerOptions: {
             ignoreDuplicateSlashes: true,
             ignoreTrailingSlash: true,
