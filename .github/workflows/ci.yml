@@ -52,7 +52,28 @@ jobs:
           router = router_path.read_text()
           old_limit = 'const MAX_REQUEST_BODY_BYTES = 64 * 1024;'
           assert router.count(old_limit) == 1
-          router_path.write_text(router.replace(old_limit, 'export const MAX_REQUEST_BODY_BYTES = 64 * 1024;'))
+          router = router.replace(old_limit, 'export const MAX_REQUEST_BODY_BYTES = 64 * 1024;')
+
+          old_fastify_options = """    const server = Fastify({
+              bodyLimit: MAX_REQUEST_BODY_BYTES,
+              exposeHeadRoutes: false,
+              ignoreDuplicateSlashes: true,
+              ignoreTrailingSlash: true,
+              logger: false,
+          })
+          """
+          new_fastify_options = """    const server = Fastify({
+              bodyLimit: MAX_REQUEST_BODY_BYTES,
+              exposeHeadRoutes: false,
+              logger: false,
+              routerOptions: {
+                  ignoreDuplicateSlashes: true,
+                  ignoreTrailingSlash: true,
+              },
+          })
+          """
+          assert router.count(old_fastify_options) == 1
+          router_path.write_text(router.replace(old_fastify_options, new_fastify_options))
 
           test_path = Path('tests/http-limits.test.ts')
           test = test_path.read_text()
@@ -106,7 +127,7 @@ jobs:
           commit_start = workflow.index('      - name: Commit transport cleanup\n', run_checks_start)
           workflow = workflow[:apply_start] + workflow[run_checks_start:commit_start]
           workflow = workflow.replace('permissions:\n  contents: write', 'permissions:\n  contents: read')
-          workflow_path.write_text(workflow)
+          workflow_path.write_text(workflow.rstrip() + '\n')
           PY
 
       - name: Run checks
