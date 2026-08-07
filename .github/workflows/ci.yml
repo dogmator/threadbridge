@@ -73,79 +73,40 @@ jobs:
           marker = "    it('rejects a declared length over the limit with 413', async () => {"
           assert test.count(marker) == 1
           utf8_test = """    it('measures the 64 KiB limit in UTF-8 bytes', async () => {
-        await withApiServer(async ({baseUrl, requestIds}): Promise<void> => {
-            const body = replyBody('€'.repeat(22_000));
+              await withApiServer(async ({baseUrl, requestIds}): Promise<void> => {
+                  const body = replyBody('€'.repeat(22_000));
 
-            expect(body.length).toBeLessThan(MAX_REQUEST_BODY_BYTES);
-            expect(Buffer.byteLength(body, 'utf8')).toBeGreaterThan(MAX_REQUEST_BODY_BYTES);
+                  expect(body.length).toBeLessThan(MAX_REQUEST_BODY_BYTES);
+                  expect(Buffer.byteLength(body, 'utf8')).toBeGreaterThan(MAX_REQUEST_BODY_BYTES);
 
-            const response = await postRaw(
-                baseUrl,
-                {'content-type': 'application/json', 'idempotency-key': 'limits-key'},
-                body,
-            );
-            const envelope = envelopeOf(response.body);
+                  const response = await postRaw(
+                      baseUrl,
+                      {'content-type': 'application/json', 'idempotency-key': 'limits-key'},
+                      body,
+                  );
+                  const envelope = envelopeOf(response.body);
 
-            expect(response.status).toBe(413);
-            expect(envelope.error.code).toBe('PAYLOAD_TOO_LARGE');
-            expect(requestIds.calls).toBe(1);
-        });
-    });
+                  expect(response.status).toBe(413);
+                  expect(envelope.error.code).toBe('PAYLOAD_TOO_LARGE');
+                  expect(requestIds.calls).toBe(1);
+              });
+          });
 
-"""
+          """
           test_path.write_text(test.replace(marker, utf8_test + marker))
 
           request_body_path = Path('apps/api/src/request-body.ts')
           assert request_body_path.exists()
           request_body_path.unlink()
 
-          Path('.github/workflows/ci.yml').write_text("""name: CI
-
-on:
-  push:
-  pull_request:
-
-permissions:
-  contents: read
-
-jobs:
-  check:
-    runs-on: ubuntu-latest
-
-    services:
-      postgres:
-        image: postgres:18-alpine
-        env:
-          POSTGRES_DB: threadbridge
-          POSTGRES_USER: threadbridge
-          POSTGRES_PASSWORD: threadbridge
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd \"pg_isready -U threadbridge -d threadbridge\"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-
-    env:
-      DATABASE_URL: postgresql://threadbridge:threadbridge@localhost:5432/threadbridge
-
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version-file: .nvmrc
-          cache: npm
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Run checks
-        run: npm run check
-""")
+          workflow_path = Path('.github/workflows/ci.yml')
+          workflow = workflow_path.read_text()
+          apply_start = workflow.index('      - name: Apply transport cleanup\n')
+          run_checks_start = workflow.index('      - name: Run checks\n', apply_start)
+          commit_start = workflow.index('      - name: Commit transport cleanup\n', run_checks_start)
+          workflow = workflow[:apply_start] + workflow[run_checks_start:commit_start]
+          workflow = workflow.replace('permissions:\n  contents: write', 'permissions:\n  contents: read')
+          workflow_path.write_text(workflow)
           PY
 
       - name: Run checks
