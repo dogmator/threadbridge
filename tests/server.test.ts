@@ -127,7 +127,7 @@ describe('API server', () => {
         });
     });
 
-    it('does not spend a request identifier on a successful health response', async () => {
+    it('generates exactly one request identifier for a successful health request', async () => {
         const requestIds = new CountingRequestIdFactory('request-1');
 
         await withApiServer(
@@ -137,7 +137,7 @@ describe('API server', () => {
             requestIds.create,
         );
 
-        expect(requestIds.calls).toBe(0);
+        expect(requestIds.calls).toBe(1);
     });
 
     it('answers an unknown route with status 404', async () => {
@@ -174,6 +174,25 @@ describe('API server', () => {
             },
             requestIds.create,
         );
+    });
+
+    it('does not trust a client-supplied request identifier', async () => {
+        const requestIds = new CountingRequestIdFactory('request-1');
+
+        await withApiServer(
+            async (baseUrl): Promise<void> => {
+                const response = await fetch(`${baseUrl}/unknown`, {
+                    headers: {'x-request-id': 'client-controlled'},
+                });
+                const body = (await response.json()) as HttpErrorEnvelope;
+
+                expect(body.error.requestId).toBe('request-1');
+                expect(body.error.requestId).not.toBe('client-controlled');
+            },
+            requestIds.create,
+        );
+
+        expect(requestIds.calls).toBe(1);
     });
 
     it('generates one request identifier for one error response', async () => {

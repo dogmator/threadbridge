@@ -53,21 +53,21 @@ const sendJson = (
 const sendFailure = (
     reply: FastifyReply,
     failure: CommentsFailure,
-    dependencies: ApiServerDependencies,
+    requestId: string,
 ): FastifyReply => {
-    const mapped = toHttpErrorResponse(failure, dependencies.requestIdFactory());
+    const mapped = toHttpErrorResponse(failure, requestId);
 
     return sendJson(reply, mapped.status, mapped.body, mapped.headers);
 };
 
 const sendTransportError = (
     reply: FastifyReply,
-    dependencies: ApiServerDependencies,
+    requestId: string,
     [statusCode, code, message]: TransportError,
 ): FastifyReply => sendJson(
     reply,
     statusCode,
-    toErrorEnvelope(code, message, dependencies.requestIdFactory()),
+    toErrorEnvelope(code, message, requestId),
 );
 
 const makeConnectionNonReusable = (request: IncomingMessage, response: ServerResponse): void => {
@@ -137,21 +137,20 @@ type CommentPageLoader = (
 const respondWithCommentPage = async (
     request: FastifyRequest,
     reply: FastifyReply,
-    dependencies: ApiServerDependencies,
     rawId: string,
     load: CommentPageLoader,
 ): Promise<FastifyReply> => {
     const cursor = readCursor(request);
 
     if (!UUID_PATTERN.test(rawId) || cursor === undefined) {
-        return await sendTransportError(reply, dependencies, TRANSPORT_ERRORS.validation);
+        return await sendTransportError(reply, request.id, TRANSPORT_ERRORS.validation);
     }
 
     const result = await load(rawId, cursor);
 
     return result.ok
         ? await sendJson(reply, 200, toCommentPageResponse(result.value))
-        : await sendFailure(reply, result.error, dependencies);
+        : await sendFailure(reply, result.error, request.id);
 };
 
 const isValidationError = (error: FastifyError): boolean =>
@@ -161,7 +160,9 @@ export const createHttpRouter = (dependencies: ApiServerDependencies): FastifyIn
     const server = Fastify({
         bodyLimit: MAX_REQUEST_BODY_BYTES,
         exposeHeadRoutes: false,
+        genReqId: (): string => dependencies.requestIdFactory(),
         logger: false,
+        requestIdHeader: false,
         routerOptions: {
             ignoreDuplicateSlashes: true,
             ignoreTrailingSlash: true,
@@ -184,19 +185,19 @@ export const createHttpRouter = (dependencies: ApiServerDependencies): FastifyIn
 
         if (error.code === 'FST_ERR_CTP_BODY_TOO_LARGE') {
             makeConnectionNonReusable(request.raw, reply.raw);
-            sendTransportError(reply, dependencies, TRANSPORT_ERRORS.payloadTooLarge);
+            sendTransportError(reply, request.id, TRANSPORT_ERRORS.payloadTooLarge);
             return;
         }
 
         sendTransportError(
             reply,
-            dependencies,
+            request.id,
             isValidationError(error) ? TRANSPORT_ERRORS.validation : TRANSPORT_ERRORS.internal,
         );
     });
 
-    server.setNotFoundHandler((_request, reply): void => {
-        sendTransportError(reply, dependencies, TRANSPORT_ERRORS.routeNotFound);
+    server.setNotFoundHandler((request, reply): void => {
+        sendTransportError(reply, request.id, TRANSPORT_ERRORS.routeNotFound);
     });
 
     server.get('/health', (_request, reply): void => {
@@ -207,7 +208,6 @@ export const createHttpRouter = (dependencies: ApiServerDependencies): FastifyIn
         await respondWithCommentPage(
             request,
             reply,
-            dependencies,
             request.params.postId,
             async (rawId, cursor) => {
                 const postId = toPostId(rawId);
@@ -223,7 +223,6 @@ export const createHttpRouter = (dependencies: ApiServerDependencies): FastifyIn
         async (request, reply) => await respondWithCommentPage(
             request,
             reply,
-            dependencies,
             request.params.commentId,
             async (rawId, cursor) => {
                 const commentId = toCommentId(rawId);
@@ -245,7 +244,7 @@ export const createHttpRouter = (dependencies: ApiServerDependencies): FastifyIn
                 makeConnectionNonReusable(request.raw, reply.raw);
                 return await sendTransportError(
                     reply,
-                    dependencies,
+                    request.id,
                     TRANSPORT_ERRORS.unsupportedMediaType,
                 );
             },
@@ -255,7 +254,7 @@ export const createHttpRouter = (dependencies: ApiServerDependencies): FastifyIn
             const query = parseReplyRequest(request.body, request.headers['idempotency-key']);
 
             if (query === null) {
-                return await sendTransportError(reply, dependencies, TRANSPORT_ERRORS.validation);
+                return await sendTransportError(reply, request.id, TRANSPORT_ERRORS.validation);
             }
 
             const result = await dependencies.replyToComment.execute(query);
@@ -266,7 +265,7 @@ export const createHttpRouter = (dependencies: ApiServerDependencies): FastifyIn
                     result.value.kind === 'created' ? 201 : 200,
                     toCommentResponse(result.value.comment),
                 )
-                : await sendFailure(reply, result.error, dependencies);
+                : await sendFailure(reply, result.error, request.id);
         },
     );
 
