@@ -1,4 +1,4 @@
-FROM node:24.18.1-alpine AS build
+FROM node:24.18.1-alpine@sha256:f70403e87646dc51b45295f4b8b70cdad0b63d2297c4c9899119b03f7af7a6b3 AS build
 
 WORKDIR /app
 
@@ -14,7 +14,7 @@ COPY apps/api/src apps/api/src
 COPY packages/comments/src packages/comments/src
 RUN npm run build
 
-FROM node:24.18.1-alpine AS production-dependencies
+FROM node:24.18.1-alpine@sha256:f70403e87646dc51b45295f4b8b70cdad0b63d2297c4c9899119b03f7af7a6b3 AS production-dependencies
 
 WORKDIR /app
 
@@ -24,7 +24,7 @@ COPY packages/comments/package.json packages/comments/package.json
 RUN npm ci --omit=dev --ignore-scripts \
     && npm cache clean --force
 
-FROM node:24.18.1-alpine AS runtime
+FROM node:24.18.1-alpine@sha256:f70403e87646dc51b45295f4b8b70cdad0b63d2297c4c9899119b03f7af7a6b3 AS runtime
 
 ENV NODE_ENV=production
 WORKDIR /app
