@@ -143,12 +143,28 @@ implements ReplyPublicationOperationRepository {
                 last_failure_code = null,
                 updated_at = now()
             where id = ${operationId}
+              and status <> 'published'
             returning *
         `;
 
-        if (rows.length !== 1) {
-            throw new Error('Publishing an operation did not update exactly one row.');
+        if (rows.length === 1) {
+            return;
         }
+
+        const current = (await this.sql<Pick<OperationRow, 'status' | 'comment_id'>[]>`
+            select status, comment_id from reply_publication_operations
+            where id = ${operationId}
+        `).at(0);
+
+        if (current?.status === 'published' && current.comment_id === commentId) {
+            return;
+        }
+
+        if (current?.status === 'published') {
+            throw new Error('A published operation cannot reference a different comment.');
+        }
+
+        throw new Error('Publishing an operation did not update exactly one row.');
     }
 
     public async markFailed(
@@ -166,11 +182,27 @@ implements ReplyPublicationOperationRepository {
                 last_failure_code = ${failureCode},
                 updated_at = now()
             where id = ${operationId}
+              and (
+                  status = 'pending'
+                  or (status = 'retryable_failed' and ${status}::text in ('failed', 'indeterminate'))
+                  or (status = 'failed' and ${status}::text = 'indeterminate')
+              )
             returning *
         `;
 
-        if (rows.length !== 1) {
-            throw new Error('Failing an operation did not update exactly one row.');
+        if (rows.length === 1) {
+            return;
         }
+
+        const current = (await this.sql<Pick<OperationRow, 'status'>[]>`
+            select status from reply_publication_operations
+            where id = ${operationId}
+        `).at(0);
+
+        if (current !== undefined) {
+            return;
+        }
+
+        throw new Error('Failing an operation did not update exactly one row.');
     }
 }

@@ -49,7 +49,8 @@ before the use case runs. An oversized body (`413`) or unsupported media type (`
 connection non-reusable and drains unread request bytes without buffering them, so leftover input
 cannot be parsed as another request on the connection.
 
-Transport-local field limits are 200 characters for an idempotency key after trimming, 10,000 for
+Transport-local field limits are 200 characters for an idempotency key after HTTP field-value
+parsing with no additional application canonicalization, 10,000 for
 reply content, and 4,096 for a cursor. Accepted content is never normalized or rewritten. Provider
 cursors remain opaque and reach the selected adapter unchanged.
 

@@ -109,7 +109,7 @@ The HTTP boundary enforces:
 | Input | Limit |
 | --- | --- |
 | Request body | 64 KiB, measured in received bytes |
-| `Idempotency-Key` | 200 characters after trimming |
+| `Idempotency-Key` | 200 characters after HTTP field-value parsing; no additional application canonicalization |
 | Reply content | 10,000 characters |
 | Cursor | 4,096 characters |
 | Request receive phase | 30 seconds |

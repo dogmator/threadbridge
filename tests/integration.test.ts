@@ -9,6 +9,8 @@ import {PostgresCommentRepository}
     from '../apps/api/src/adapters/postgres/comment-repository.js';
 import {PostgresPublishedPostRepository}
     from '../apps/api/src/adapters/postgres/published-post-repository.js';
+import {PostgresReplyPublicationOperationRepository}
+    from '../apps/api/src/adapters/postgres/reply-publication-operation-repository.js';
 import {createApiComponents, type ApiComponents} from '../apps/api/src/composition.js';
 import {runMigrations} from '../apps/api/src/migrations.js';
 import {createApiServer} from '../apps/api/src/server.js';
@@ -1054,10 +1056,85 @@ class ProviderIdempotentGateway implements SocialCommentsGateway {
     }
 }
 
+class OrderedOutcomeGateway implements SocialCommentsGateway {
+    public readonly capabilities: SocialCommentsCapabilities = {
+        rootComments: false,
+        directReplies: false,
+        replyPublication: true,
+        publicationIdempotency: 'native',
+    };
+
+    private calls = 0;
+
+    private signalEntered: (() => void) | null = null;
+
+    private readonly bothEntered = new Promise<void>((resolve): void => {
+        this.signalEntered = resolve;
+    });
+
+    private readonly releases: readonly (() => void)[];
+
+    private readonly released: readonly Promise<void>[];
+
+    public constructor() {
+        const resolvers: (() => void)[] = [];
+        this.released = [0, 1].map((): Promise<void> => new Promise<void>((resolve): void => {
+            resolvers.push(resolve);
+        }));
+        this.releases = resolvers;
+    }
+
+    public get callCount(): number {
+        return this.calls;
+    }
+
+    public async waitForBothCalls(): Promise<void> {
+        await this.bothEntered;
+    }
+
+    public release(call: number): void {
+        this.releases[call]?.();
+    }
+
+    public getComments(): never {
+        throw new Error('This gateway only publishes.');
+    }
+
+    public getReplies(): never {
+        throw new Error('This gateway only publishes.');
+    }
+
+    public async replyToComment(
+        input: ReplyToPlatformCommentInput,
+    ): Promise<Result<PlatformComment, PlatformFailure | IndeterminatePlatformResultFailure>> {
+        const call = this.calls;
+        this.calls += 1;
+
+        if (this.calls === 2) {
+            this.signalEntered?.();
+        }
+
+        await this.released[call];
+
+        if (call === 1) {
+            return {ok: false, error: {code: 'PLATFORM_TIMEOUT'}};
+        }
+
+        return ok<PlatformComment>({
+            externalCommentId: toExternalCommentId(`integration-ordered-outcome-${input.idempotencyKey}`),
+            externalAuthorId: toExternalAuthorId('integration-author-self'),
+            content: input.content,
+            createdAt: platformCreatedAt,
+            metadata: null,
+        });
+    }
+}
+
 describe('external publication under concurrency', () => {
     it('creates one external publication for two concurrent requests with one key', async () => {
         const comments = new PostgresCommentRepository(sql);
         const contexts = new PostgresCommentReplyContextRepository(sql);
+        const operations = new PostgresReplyPublicationOperationRepository(sql);
         const [parent] = await comments.saveMany([importedComment('provider-idempotent', null)]);
 
         if (parent === undefined) {
@@ -1069,6 +1146,7 @@ describe('external publication under concurrency', () => {
             contexts,
             new Map<SocialPlatform, SocialCommentsGateway>([[toSocialPlatform('demo'), gateway]]),
             comments,
+            operations,
         );
         const key = toIdempotencyKey('integration-key-provider');
         const request = {
@@ -1079,6 +1157,7 @@ describe('external publication under concurrency', () => {
 
         // Neither call rejects: a database exception would surface here as a rejected promise.
         const results = await Promise.all([useCase.execute(request), useCase.execute(request)]);
+        const replay = await useCase.execute(request);
         const rows = await sql<IdRow[]>`
             select id from comments where idempotency_key = ${key}
         `;
@@ -1087,9 +1166,66 @@ describe('external publication under concurrency', () => {
 
         expect(gateway.externalPublications).toBe(1);
         expect(results.every((result): boolean => result.ok)).toBe(true);
+        expect(replay).toMatchObject({ok: true, value: {kind: 'existing'}});
         expect(new Set(identifiers).size).toBe(1);
         expect(rows).toHaveLength(1);
         expect(identifiers.at(0)).toBe(rows.at(0)?.id);
+        expect(gateway.externalPublications).toBe(1);
+    });
+
+    it('retains success and replays it when a concurrent retryable failure finishes later', async () => {
+        const comments = new PostgresCommentRepository(sql);
+        const contexts = new PostgresCommentReplyContextRepository(sql);
+        const operations = new PostgresReplyPublicationOperationRepository(sql);
+        const [parent] = await comments.saveMany([importedComment('ordered-outcome', null)]);
+
+        if (parent === undefined) {
+            throw new Error('The parent comment was not persisted.');
+        }
+
+        const gateway = new OrderedOutcomeGateway();
+        const useCase = new ReplyToComment(
+            contexts,
+            new Map<SocialPlatform, SocialCommentsGateway>([[toSocialPlatform('demo'), gateway]]),
+            comments,
+            operations,
+        );
+        const key = toIdempotencyKey('integration-key-ordered-outcome');
+        const request = {parentCommentId: parent.id, content: 'Ordered outcome', idempotencyKey: key};
+        const executions = [useCase.execute(request), useCase.execute(request)] as const;
+
+        await gateway.waitForBothCalls();
+        gateway.release(0);
+
+        let published = false;
+
+        for (let attempt = 0; attempt < 100; attempt += 1) {
+            const row = (await sql<{readonly status: string}[]>`
+                select status from reply_publication_operations
+                where account_id = ${fixtureAccountId} and idempotency_key = ${key}
+            `).at(0);
+
+            if (row?.status === 'published') {
+                published = true;
+                break;
+            }
+
+            await setTimeout(10);
+        }
+
+        expect(published).toBe(true);
+        gateway.release(1);
+        await Promise.all(executions);
+        const replay = await useCase.execute(request);
+        const operation = (await sql<{readonly status: string; readonly comment_id: string | null}[]>`
+            select status, comment_id from reply_publication_operations
+            where account_id = ${fixtureAccountId} and idempotency_key = ${key}
+        `).at(0);
+
+        expect(operation?.status).toBe('published');
+        expect(operation?.comment_id).not.toBeNull();
+        expect(replay).toMatchObject({ok: true, value: {kind: 'existing'}});
+        expect(gateway.callCount).toBe(2);
     });
 });
 

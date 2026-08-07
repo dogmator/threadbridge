@@ -104,9 +104,7 @@ const parseReplyRequest = (
         return null;
     }
 
-    const idempotencyKey = idempotencyHeader.trim();
-
-    if (idempotencyKey === '' || idempotencyKey.length > MAX_IDEMPOTENCY_KEY_CHARACTERS) {
+    if (idempotencyHeader === '' || idempotencyHeader.length > MAX_IDEMPOTENCY_KEY_CHARACTERS) {
         return null;
     }
 
@@ -119,7 +117,7 @@ const parseReplyRequest = (
     return {
         parentCommentId: toCommentId(body.parentCommentId),
         content: body.content,
-        idempotencyKey: toIdempotencyKey(idempotencyKey),
+        idempotencyKey: toIdempotencyKey(idempotencyHeader),
     };
 };
 
