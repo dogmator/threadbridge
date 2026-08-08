@@ -276,6 +276,8 @@ export class ReplyToComment {
         });
 
         if (!published.ok) {
+            await markFailed(operation, statusOf(published.error), published.error.code);
+
             if (
                 published.error.code === 'PLATFORM_RESOURCE_NOT_FOUND'
                 && this.projectionStates !== null
@@ -283,7 +285,6 @@ export class ReplyToComment {
                 await this.projectionStates.markDeleted(query.parentCommentId);
             }
 
-            await markFailed(operation, statusOf(published.error), published.error.code);
             return err<ReplyToCommentFailure>(published.error);
         }
 

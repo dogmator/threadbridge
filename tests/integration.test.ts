@@ -17,6 +17,7 @@ import {createApiServer} from '../apps/api/src/server.js';
 import type {CommentPageResponse, CommentResponse} from '../apps/api/src/comment-response.js';
 import type {HttpErrorEnvelope} from '../apps/api/src/http-error.js';
 import {
+    err,
     ok,
     ReplyToComment,
     toAccountId,
@@ -29,6 +30,7 @@ import {
     type AccountId,
     type Comment,
     type CommentId,
+    type CommentProjectionStateRepository,
     type ExternalCommentId,
     type IdempotencyKey,
     type IndeterminatePlatformResultFailure,
@@ -794,6 +796,74 @@ class ConvergingGateway implements SocialCommentsGateway {
 }
 
 describe('ReplyToComment against real PostgreSQL', () => {
+    it('preserves a confirmed provider not-found when projection persistence fails', async () => {
+        const comments = new PostgresCommentRepository(sql);
+        const contexts = new PostgresCommentReplyContextRepository(sql);
+        const operations = new PostgresReplyPublicationOperationRepository(sql);
+        const [parent] = await comments.saveMany([importedComment('projection-failure', null)]);
+
+        if (parent === undefined) {
+            throw new Error('The parent comment was not persisted.');
+        }
+
+        let providerCalls = 0;
+        let projectionCalls = 0;
+        const gateway: SocialCommentsGateway = {
+            capabilities: {
+                rootComments: false,
+                directReplies: false,
+                replyPublication: true,
+                publicationIdempotency: 'none',
+            },
+            getComments: (): never => {
+                throw new Error('This gateway only publishes.');
+            },
+            getReplies: (): never => {
+                throw new Error('This gateway only publishes.');
+            },
+            replyToComment: (): Promise<Result<PlatformComment, PlatformFailure>> => {
+                providerCalls += 1;
+                return Promise.resolve(
+                    err<PlatformFailure>({code: 'PLATFORM_RESOURCE_NOT_FOUND'}),
+                );
+            },
+        };
+        const projectionStates: CommentProjectionStateRepository = {
+            markDeleted: (): Promise<void> => {
+                projectionCalls += 1;
+                return Promise.reject(new Error('Projection persistence failed.'));
+            },
+        };
+        const useCase = new ReplyToComment(
+            contexts,
+            new Map([[toSocialPlatform('demo'), gateway]]),
+            comments,
+            operations,
+            projectionStates,
+        );
+        const key = toIdempotencyKey('integration-key-projection-failure');
+        const request = {parentCommentId: parent.id, content: 'Reply', idempotencyKey: key};
+
+        await expect(useCase.execute(request)).rejects.toThrow('Projection persistence failed.');
+
+        const afterInterruption = (await sql<{
+            readonly status: string;
+            readonly last_failure_code: string | null;
+        }[]>`
+            select status, last_failure_code from reply_publication_operations
+            where account_id = ${fixtureAccountId} and idempotency_key = ${key}
+        `).at(0);
+        const replay = await useCase.execute(request);
+
+        expect(afterInterruption).toEqual({
+            status: 'failed',
+            last_failure_code: 'PLATFORM_RESOURCE_NOT_FOUND',
+        });
+        expect(replay).toEqual({ok: false, error: {code: 'PLATFORM_RESOURCE_NOT_FOUND'}});
+        expect(providerCalls).toBe(1);
+        expect(projectionCalls).toBe(1);
+    });
+
     it('resolves a same-key race as one row plus an idempotency conflict', async () => {
         const comments = new PostgresCommentRepository(sql);
         const contexts = new PostgresCommentReplyContextRepository(sql);
