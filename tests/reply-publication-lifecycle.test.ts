@@ -195,9 +195,14 @@ describe('durable reply publication lifecycle', () => {
             {ok: false, error: {code: 'PLATFORM_PERMISSION_DENIED'}},
         ],
         [
-            'indeterminate',
+            'indeterminate platform result',
             operation('indeterminate', null, 'INDETERMINATE_PLATFORM_RESULT'),
             {ok: false, error: {code: 'INDETERMINATE_PLATFORM_RESULT', platform}},
+        ],
+        [
+            'indeterminate idempotency conflict',
+            operation('indeterminate', null, 'IDEMPOTENCY_CONFLICT'),
+            {ok: false, error: {code: 'IDEMPOTENCY_CONFLICT', idempotencyKey: key}},
         ],
     ] as const)(
         'replays a completed %s operation without an active parent context',

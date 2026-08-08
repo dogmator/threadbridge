@@ -116,6 +116,30 @@ const terminalFailureOf = (
     }
 };
 
+const indeterminateFailureOf = (
+    query: ReplyToCommentQuery,
+    code: ReplyPublicationFailureCode | null,
+    platform: SocialPlatform,
+): Result<ReplyToCommentSuccess, ReplyToCommentFailure> => {
+    switch (code) {
+        case 'INDETERMINATE_PLATFORM_RESULT':
+            return indeterminate(platform);
+        case 'IDEMPOTENCY_CONFLICT':
+            return conflict(query.idempotencyKey);
+        case null:
+        case 'PLATFORM_AUTHENTICATION_FAILED':
+        case 'PLATFORM_PERMISSION_DENIED':
+        case 'PLATFORM_RESOURCE_NOT_FOUND':
+        case 'PLATFORM_VALIDATION_FAILED':
+        case 'PLATFORM_RATE_LIMITED':
+        case 'PLATFORM_TIMEOUT':
+        case 'PLATFORM_UNAVAILABLE':
+        case 'PLATFORM_OPERATION_UNSUPPORTED':
+        case 'PLATFORM_CURSOR_INVALID':
+            throw new Error('An indeterminate operation has an invalid failure code.');
+    }
+};
+
 const replayWithoutActiveContext = (
     query: ReplyToCommentQuery,
     operation: ReplyPublicationOperation,
@@ -138,7 +162,7 @@ const replayWithoutActiveContext = (
         case 'failed':
             return terminalFailureOf(operation.lastFailureCode);
         case 'indeterminate':
-            return indeterminate(platform);
+            return indeterminateFailureOf(query, operation.lastFailureCode, platform);
         case 'pending':
         case 'retryable_failed':
             return null;
@@ -242,7 +266,7 @@ export class ReplyToComment {
             }
 
             if (operation.status === 'indeterminate') {
-                return indeterminate(context.platform);
+                return indeterminateFailureOf(query, operation.lastFailureCode, context.platform);
             }
 
             if (operation.status === 'failed') {
