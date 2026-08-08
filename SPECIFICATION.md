@@ -270,7 +270,9 @@ projection.
 For `POST /comments`, the application:
 
 1. validates transport input and the idempotency key;
-2. resolves the parent comment context and selected provider gateway;
+2. resolves the active parent comment context and selected provider gateway; if the projection is
+   no longer active, the parent derives its owning account so an existing completed operation may
+   still replay by account and key, but no new or retryable provider work starts;
 3. creates or loads the durable operation by account and key;
 4. compares parent identity and request fingerprint;
 5. rejects conflicting key reuse without calling the provider;

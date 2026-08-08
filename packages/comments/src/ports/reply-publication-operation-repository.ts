@@ -1,4 +1,9 @@
-import type {AccountId, CommentId, IdempotencyKey} from '../domain/identifiers.js';
+import type {
+    AccountId,
+    CommentId,
+    IdempotencyKey,
+    SocialPlatform,
+} from '../domain/identifiers.js';
 import type {
     ReplyPublicationFailureCode,
     ReplyPublicationOperation,
@@ -18,6 +23,13 @@ export type BeginReplyPublicationResult =
     | {readonly kind: 'conflict'};
 
 export interface ReplyPublicationOperationRepository {
+    findExistingByParent(
+        parentCommentId: CommentId,
+        idempotencyKey: IdempotencyKey,
+    ): Promise<{
+        readonly operation: ReplyPublicationOperation;
+        readonly platform: SocialPlatform;
+    } | null>;
     begin(input: BeginReplyPublicationInput): Promise<BeginReplyPublicationResult>;
     markPublished(operationId: string, commentId: CommentId): Promise<void>;
     markFailed(

@@ -122,6 +122,11 @@ afterAll(async (): Promise<void> => {
         delete from reply_publication_operations
         where account_id in (
             select id from accounts where external_account_id = ${fixtureExternalAccountId}
+        ) or parent_comment_id in (
+            select comments.id from comments
+            join posts on posts.id = comments.post_id
+            join accounts on accounts.id = posts.account_id
+            where accounts.external_account_id = ${fixtureExternalAccountId}
         )
     `;
     await sql`
@@ -796,6 +801,97 @@ class ConvergingGateway implements SocialCommentsGateway {
 }
 
 describe('ReplyToComment against real PostgreSQL', () => {
+    it('replays a terminal operation after its parent projection is deleted', async () => {
+        const comments = new PostgresCommentRepository(sql);
+        const contexts = new PostgresCommentReplyContextRepository(sql);
+        const operations = new PostgresReplyPublicationOperationRepository(sql);
+        const [parent] = await comments.saveMany([importedComment('deleted-terminal-replay', null)]);
+
+        if (parent === undefined) {
+            throw new Error('The parent comment was not persisted.');
+        }
+
+        let providerCalls = 0;
+        const gateway: SocialCommentsGateway = {
+            capabilities: {
+                rootComments: false,
+                directReplies: false,
+                replyPublication: true,
+                publicationIdempotency: 'none',
+            },
+            getComments: (): never => {
+                throw new Error('This gateway only publishes.');
+            },
+            getReplies: (): never => {
+                throw new Error('This gateway only publishes.');
+            },
+            replyToComment: (): Promise<Result<PlatformComment, PlatformFailure>> => {
+                providerCalls += 1;
+                return Promise.resolve(
+                    err<PlatformFailure>({code: 'PLATFORM_RESOURCE_NOT_FOUND'}),
+                );
+            },
+        };
+        const useCase = new ReplyToComment(
+            contexts,
+            new Map([[toSocialPlatform('demo'), gateway]]),
+            comments,
+            operations,
+            contexts,
+        );
+        const key = toIdempotencyKey('integration-key-deleted-terminal-replay');
+        const request = {parentCommentId: parent.id, content: 'Reply', idempotencyKey: key};
+        const unrelatedAccount = (await sql<IdRow[]>`
+            select id from accounts where external_account_id = 'demo-limited-account-1'
+        `).at(0);
+
+        if (unrelatedAccount === undefined) {
+            throw new Error('The unrelated account fixture was not found.');
+        }
+
+        // This row is schema-valid but deliberately points another account at the same parent and
+        // key. Recovery must derive the parent's owning account before applying the durable key.
+        await sql`
+            insert into reply_publication_operations (
+                account_id, parent_comment_id, idempotency_key, request_fingerprint,
+                status, last_failure_code
+            ) values (
+                ${unrelatedAccount.id}, ${parent.id}, ${key},
+                ${JSON.stringify([parent.id, request.content])},
+                'failed', 'PLATFORM_PERMISSION_DENIED'
+            )
+        `;
+
+        const first = await useCase.execute(request);
+        const replay = await useCase.execute(request);
+        const conflictingReplay = await useCase.execute({...request, content: 'Different reply'});
+        const newRequest = await useCase.execute({
+            ...request,
+            idempotencyKey: toIdempotencyKey('integration-key-deleted-parent-new-request'),
+        });
+        const projection = (await sql<{readonly projection_state: string}[]>`
+            select projection_state from comments where id = ${parent.id}
+        `).at(0);
+        const matchingOperations = await sql<IdRow[]>`
+            select id from reply_publication_operations
+            where parent_comment_id = ${parent.id} and idempotency_key = ${key}
+        `;
+
+        expect(first).toEqual({ok: false, error: {code: 'PLATFORM_RESOURCE_NOT_FOUND'}});
+        expect(replay).toEqual({ok: false, error: {code: 'PLATFORM_RESOURCE_NOT_FOUND'}});
+        expect(conflictingReplay).toEqual({
+            ok: false,
+            error: {code: 'IDEMPOTENCY_CONFLICT', idempotencyKey: key},
+        });
+        expect(newRequest).toEqual({
+            ok: false,
+            error: {code: 'COMMENT_NOT_FOUND', commentId: parent.id},
+        });
+        expect(projection?.projection_state).toBe('deleted');
+        expect(matchingOperations).toHaveLength(2);
+        expect(providerCalls).toBe(1);
+    });
+
     it('preserves a confirmed provider not-found when projection persistence fails', async () => {
         const comments = new PostgresCommentRepository(sql);
         const contexts = new PostgresCommentReplyContextRepository(sql);

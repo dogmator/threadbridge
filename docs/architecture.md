@@ -130,7 +130,10 @@ Reply publication uses a durable operation before an external write.
 
 1. The transport validates `POST /comments` and passes the parent ID, exact content, and idempotency
    key to `ReplyToComment`.
-2. The use case resolves the parent comment context and provider gateway.
+2. The use case resolves the active parent comment context and provider gateway. If the projection
+   is no longer active, the parent derives its owning account for a narrow account-and-key lookup
+   that may replay an already completed operation; it never creates or resumes provider work
+   without an active context.
 3. `ReplyPublicationOperationRepository.begin` creates or loads the operation identified by
    `(account_id, idempotency_key)` and compares its parent/request fingerprint.
 4. Conflicting key reuse returns `IDEMPOTENCY_CONFLICT` without a provider call.

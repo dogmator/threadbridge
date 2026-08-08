@@ -10,6 +10,7 @@ import type {
 import type {CommentId, IdempotencyKey, SocialPlatform} from '../domain/identifiers.js';
 import type {
     ReplyPublicationFailureCode,
+    ReplyPublicationOperation,
     ReplyPublicationStatus,
 } from '../domain/reply-publication-operation.js';
 import {err, ok, type Result} from '../domain/result.js';
@@ -91,6 +92,9 @@ const replayOf = (
         ? ok<ReplyToCommentSuccess>({kind: 'existing', comment})
         : conflict(query.idempotencyKey);
 
+const requestFingerprintOf = (query: ReplyToCommentQuery): string =>
+    JSON.stringify([query.parentCommentId, query.content]);
+
 const terminalFailureOf = (
     code: ReplyPublicationFailureCode | null,
 ): Result<ReplyToCommentSuccess, ReplyToCommentFailure> => {
@@ -109,6 +113,35 @@ const terminalFailureOf = (
         case 'IDEMPOTENCY_CONFLICT':
         case 'INDETERMINATE_PLATFORM_RESULT':
             throw new Error('A terminally failed operation has an invalid failure code.');
+    }
+};
+
+const replayWithoutActiveContext = (
+    query: ReplyToCommentQuery,
+    operation: ReplyPublicationOperation,
+    platform: SocialPlatform,
+): Result<ReplyToCommentSuccess, ReplyToCommentFailure> | null => {
+    if (
+        operation.parentCommentId !== query.parentCommentId
+        || operation.requestFingerprint !== requestFingerprintOf(query)
+    ) {
+        return conflict(query.idempotencyKey);
+    }
+
+    switch (operation.status) {
+        case 'published':
+            if (operation.comment === null) {
+                throw new Error('A published operation has no stored comment.');
+            }
+
+            return replayOf(operation.comment, query);
+        case 'failed':
+            return terminalFailureOf(operation.lastFailureCode);
+        case 'indeterminate':
+            return indeterminate(platform);
+        case 'pending':
+        case 'retryable_failed':
+            return null;
     }
 };
 
@@ -134,9 +167,29 @@ export class ReplyToComment {
     public async execute(
         query: ReplyToCommentQuery,
     ): Promise<Result<ReplyToCommentSuccess, ReplyToCommentFailure>> {
+        const operations = this.operations;
         const context = await this.contexts.findByCommentId(query.parentCommentId);
 
         if (context === null) {
+            if (operations !== null) {
+                const existing = await operations.findExistingByParent(
+                    query.parentCommentId,
+                    query.idempotencyKey,
+                );
+
+                if (existing !== null) {
+                    const replay = replayWithoutActiveContext(
+                        query,
+                        existing.operation,
+                        existing.platform,
+                    );
+
+                    if (replay !== null) {
+                        return replay;
+                    }
+                }
+            }
+
             return err<ReplyToCommentFailure>({
                 code: 'COMMENT_NOT_FOUND',
                 commentId: query.parentCommentId,
@@ -152,8 +205,6 @@ export class ReplyToComment {
             });
         }
 
-        const operations = this.operations;
-
         if (operations === null) {
             return await this.executeLegacy(query, context, gateway);
         }
@@ -162,7 +213,7 @@ export class ReplyToComment {
             accountId: context.accountId,
             parentCommentId: query.parentCommentId,
             idempotencyKey: query.idempotencyKey,
-            requestFingerprint: JSON.stringify([query.parentCommentId, query.content]),
+            requestFingerprint: requestFingerprintOf(query),
         });
 
         if (begun.kind === 'conflict') {

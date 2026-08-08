@@ -2,14 +2,17 @@ import {
     toAccountId,
     toCommentId,
     toIdempotencyKey,
+    toSocialPlatform,
     type BeginReplyPublicationInput,
     type BeginReplyPublicationResult,
     type Comment,
     type CommentId,
+    type IdempotencyKey,
     type ReplyPublicationFailureCode,
     type ReplyPublicationOperation,
     type ReplyPublicationOperationRepository,
     type ReplyPublicationStatus,
+    type SocialPlatform,
 } from '@threadbridge/comments';
 import type {Sql, TransactionSql} from 'postgres';
 import {toComment, type CommentRow} from './comment-row.js';
@@ -24,6 +27,21 @@ interface OperationRow {
     readonly comment_id: string | null;
     readonly last_failure_code: ReplyPublicationFailureCode | null;
 }
+
+interface RecoveryOperationRow extends OperationRow {
+    readonly platform: string;
+}
+
+const toOperation = (row: OperationRow, comment: Comment | null): ReplyPublicationOperation => ({
+    id: row.id,
+    accountId: toAccountId(row.account_id),
+    parentCommentId: toCommentId(row.parent_comment_id),
+    idempotencyKey: toIdempotencyKey(row.idempotency_key),
+    requestFingerprint: row.request_fingerprint,
+    status: row.status,
+    comment,
+    lastFailureCode: row.last_failure_code,
+});
 
 const readOperation = async (
     transaction: TransactionSql,
@@ -56,21 +74,56 @@ const readOperation = async (
         comment = toComment(stored);
     }
 
-    return {
-        id: row.id,
-        accountId: toAccountId(row.account_id),
-        parentCommentId: toCommentId(row.parent_comment_id),
-        idempotencyKey: toIdempotencyKey(row.idempotency_key),
-        requestFingerprint: row.request_fingerprint,
-        status: row.status,
-        comment,
-        lastFailureCode: row.last_failure_code,
-    };
+    return toOperation(row, comment);
 };
 
 export class PostgresReplyPublicationOperationRepository
 implements ReplyPublicationOperationRepository {
     public constructor(private readonly sql: Sql) {}
+
+    public async findExistingByParent(
+        parentCommentId: CommentId,
+        idempotencyKey: IdempotencyKey,
+    ): Promise<{
+        readonly operation: ReplyPublicationOperation;
+        readonly platform: SocialPlatform;
+    } | null> {
+        const rows = await this.sql<RecoveryOperationRow[]>`
+            select operations.*, accounts.platform
+            from comments as requested_parent
+            join posts on posts.id = requested_parent.post_id
+            join accounts on accounts.id = posts.account_id
+            join reply_publication_operations as operations
+              on operations.account_id = accounts.id
+             and operations.idempotency_key = ${idempotencyKey}
+            where requested_parent.id = ${parentCommentId}
+        `;
+        const row = rows.at(0);
+
+        if (row === undefined) {
+            return null;
+        }
+
+        let comment: Comment | null = null;
+
+        if (row.comment_id !== null) {
+            const comments = await this.sql<CommentRow[]>`
+                select * from comments where id = ${row.comment_id}
+            `;
+            const stored = comments.at(0);
+
+            if (stored === undefined) {
+                throw new Error('A published operation references a missing comment.');
+            }
+
+            comment = toComment(stored);
+        }
+
+        return {
+            operation: toOperation(row, comment),
+            platform: toSocialPlatform(row.platform),
+        };
+    }
 
     public async begin(input: BeginReplyPublicationInput): Promise<BeginReplyPublicationResult> {
         return await this.sql.begin<BeginReplyPublicationResult>(

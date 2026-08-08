@@ -60,6 +60,12 @@ class Contexts implements CommentReplyContextRepository {
     }
 }
 
+class MissingContexts implements CommentReplyContextRepository {
+    public findByCommentId(): Promise<null> {
+        return Promise.resolve(null);
+    }
+}
+
 class Comments implements CommentRepository {
     public constructor(
         private readonly calls: string[],
@@ -85,7 +91,19 @@ class Operations implements ReplyPublicationOperationRepository {
     public constructor(
         public readonly calls: string[],
         public beginResult: BeginReplyPublicationResult,
+        private readonly recovery: {
+            readonly operation: ReplyPublicationOperation;
+            readonly platform: typeof platform;
+        } | null = null,
     ) {}
+
+    public findExistingByParent(): Promise<{
+        readonly operation: ReplyPublicationOperation;
+        readonly platform: typeof platform;
+    } | null> {
+        this.calls.push('recovery');
+        return Promise.resolve(this.recovery);
+    }
 
     public begin(): Promise<BeginReplyPublicationResult> {
         this.calls.push('operation');
@@ -165,6 +183,70 @@ const published = ok<PlatformComment>({
 });
 
 describe('durable reply publication lifecycle', () => {
+    it.each([
+        [
+            'published',
+            operation('published', stored),
+            {ok: true, value: {kind: 'existing', comment: stored}},
+        ],
+        [
+            'failed',
+            operation('failed', null, 'PLATFORM_PERMISSION_DENIED'),
+            {ok: false, error: {code: 'PLATFORM_PERMISSION_DENIED'}},
+        ],
+        [
+            'indeterminate',
+            operation('indeterminate', null, 'INDETERMINATE_PLATFORM_RESULT'),
+            {ok: false, error: {code: 'INDETERMINATE_PLATFORM_RESULT', platform}},
+        ],
+    ] as const)(
+        'replays a completed %s operation without an active parent context',
+        async (_status, existing, expected): Promise<void> => {
+            const calls: string[] = [];
+            const operations = new Operations(
+                calls,
+                {kind: 'started', operation: operation('pending')},
+                {operation: existing, platform},
+            );
+            const result = await new ReplyToComment(
+                new MissingContexts(),
+                new Map([[platform, new Gateway(calls, 'none', published)]]),
+                new Comments(calls),
+                operations,
+            ).execute({parentCommentId, content: 'Reply', idempotencyKey: key});
+
+            expect(result).toEqual(expected);
+            expect(calls).toEqual(['recovery']);
+        },
+    );
+
+    it.each([
+        ['pending', null],
+        ['retryable_failed', 'PLATFORM_TIMEOUT'],
+    ] as const)(
+        'does not resume %s without an active parent context',
+        async (status, failureCode): Promise<void> => {
+            const calls: string[] = [];
+            const operations = new Operations(
+                calls,
+                {kind: 'started', operation: operation('pending')},
+                {operation: operation(status, null, failureCode), platform},
+            );
+            const result = await new ReplyToComment(
+                new MissingContexts(),
+                new Map([[platform, new Gateway(calls, 'native', published)]]),
+                new Comments(calls),
+                operations,
+            ).execute({parentCommentId, content: 'Reply', idempotencyKey: key});
+
+            expect(result).toEqual({
+                ok: false,
+                error: {code: 'COMMENT_NOT_FOUND', commentId: parentCommentId},
+            });
+            expect(calls).toEqual(['recovery']);
+        },
+    );
+
     it('records the operation before calling the provider and marks it published afterwards', async () => {
         const calls: string[] = [];
         const operations = new Operations(calls, {kind: 'started', operation: operation('pending')});
