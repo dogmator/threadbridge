@@ -1,6 +1,7 @@
 import {mkdtemp, readFile, rm, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join, resolve} from 'node:path';
+import {setImmediate as nextTurn} from 'node:timers/promises';
 import postgres, {type Sql} from 'postgres';
 import {afterAll, describe, expect, it} from 'vitest';
 import {runMigrations} from '../apps/api/src/migrations.js';
@@ -26,6 +27,16 @@ interface MigrationRecordRow {
 
 interface RelationRow {
     readonly relation: string | null;
+}
+
+interface MigrationInstanceNames {
+    readonly first: string;
+    readonly second: string;
+}
+
+interface AdvisoryLockWaitRow {
+    readonly classid: string;
+    readonly objid: string;
 }
 
 /**
@@ -64,33 +75,67 @@ const withMigrationScenario = async (
  * instances starting against one database look like from PostgreSQL's side.
  */
 const withTwoInstances = async (
-    use: (first: Sql, second: Sql, directory: string) => Promise<void>,
+    use: (
+        first: Sql,
+        second: Sql,
+        directory: string,
+        applicationNames: MigrationInstanceNames,
+    ) => Promise<void>,
 ): Promise<void> => {
     schemaIndex += 1;
 
     const schema = `migration_race_${String(process.pid)}_${String(schemaIndex)}`;
     const directory = await mkdtemp(join(tmpdir(), 'threadbridge-migrations-'));
-    const connect = (): Sql =>
+    const applicationNames = {
+        first: `${schema}_first`,
+        second: `${schema}_second`,
+    } as const;
+    const connect = (applicationName: string): Sql =>
         postgres(databaseUrl, {
             max: 1,
             onnotice: (): void => undefined,
-            connection: {search_path: schema},
+            connection: {application_name: applicationName, search_path: schema},
         });
 
     await admin`drop schema if exists ${admin(schema)} cascade`;
     await admin`create schema ${admin(schema)}`;
 
-    const first = connect();
-    const second = connect();
+    const first = connect(applicationNames.first);
+    const second = connect(applicationNames.second);
 
     try {
-        await use(first, second, directory);
+        await use(first, second, directory, applicationNames);
     } finally {
         await first.end();
         await second.end();
         await admin`drop schema if exists ${admin(schema)} cascade`;
         await rm(directory, {recursive: true, force: true});
     }
+};
+
+const waitForAdvisoryLock = async (
+    applicationName: string,
+    accepts: (row: AdvisoryLockWaitRow) => boolean,
+): Promise<AdvisoryLockWaitRow> => {
+    for (let attempt = 0; attempt < 500; attempt += 1) {
+        const rows = await admin<AdvisoryLockWaitRow[]>`
+            select locks.classid::text as classid, locks.objid::text as objid
+            from pg_stat_activity as activity
+            join pg_locks as locks on locks.pid = activity.pid
+            where activity.application_name = ${applicationName}
+              and locks.locktype = 'advisory'
+              and not locks.granted
+        `;
+        const row = rows.find(accepts);
+
+        if (row !== undefined) {
+            return row;
+        }
+
+        await nextTurn();
+    }
+
+    throw new Error(`PostgreSQL did not observe an advisory-lock wait for ${applicationName}.`);
 };
 
 const recordsOf = async (sql: Sql): Promise<readonly MigrationRecordRow[]> =>
@@ -343,19 +388,66 @@ describe('runMigrations', () => {
 
 describe('runMigrations across instances', () => {
     it('lets only one of two concurrent instances apply a pending migration', async () => {
-        await withTwoInstances(async (first, second, directory): Promise<void> => {
-            // The sleep is the synchronization point: whichever instance takes the lock holds it
-            // long enough that the other is certainly waiting rather than merely scheduled later.
-            // Neither statement tolerates being run twice, so a duplicate run cannot pass silently.
+        await withTwoInstances(async (
+            first,
+            second,
+            directory,
+            applicationNames,
+        ): Promise<void> => {
+            const barrierNamespace = 0x54_42_00_02;
+            const barrierId = 2;
+            const barrier = await admin.reserve();
+            let barrierHeld = false;
+            let runs: readonly Promise<readonly string[]>[] = [];
+
             await writeFile(
                 join(directory, '0001_concurrent.sql'),
-                'select pg_sleep(0.25);\ncreate table concurrent_probe (id integer);\n',
+                `select pg_advisory_lock(${String(barrierNamespace)}, ${String(barrierId)});\n`
+                + 'create table concurrent_probe (id integer);\n'
+                + `select pg_advisory_unlock(${String(barrierNamespace)}, ${String(barrierId)});\n`,
             );
 
-            const results = await Promise.all([
-                runMigrations(first, directory),
-                runMigrations(second, directory),
-            ]);
+            let results: readonly (readonly string[])[];
+
+            try {
+                await barrier`
+                    select pg_advisory_lock(${barrierNamespace}, ${barrierId})
+                `;
+                barrierHeld = true;
+
+                const firstRun = runMigrations(first, directory);
+                runs = [firstRun];
+                const isBarrierWait = (row: AdvisoryLockWaitRow): boolean =>
+                    row.classid === String(barrierNamespace) && row.objid === String(barrierId);
+                const firstWait = await waitForAdvisoryLock(
+                    applicationNames.first,
+                    isBarrierWait,
+                );
+                const secondRun = runMigrations(second, directory);
+                runs = [firstRun, secondRun];
+                const secondWait = await waitForAdvisoryLock(
+                    applicationNames.second,
+                    (row): boolean => !isBarrierWait(row),
+                );
+
+                expect(secondWait).not.toEqual(firstWait);
+
+                await barrier`
+                    select pg_advisory_unlock(${barrierNamespace}, ${barrierId})
+                `;
+                barrierHeld = false;
+                results = await Promise.all(runs);
+            } finally {
+                if (barrierHeld) {
+                    await barrier`
+                        select pg_advisory_unlock(${barrierNamespace}, ${barrierId})
+                    `;
+                }
+
+                await Promise.allSettled(runs);
+                barrier.release();
+            }
+
             const applied = results.flat();
             const records = await recordsOf(first);
             const relations = await first<RelationRow[]>`
