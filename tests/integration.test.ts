@@ -1329,8 +1329,7 @@ describe('retrieval REST endpoints', () => {
     beforeAll(async (): Promise<void> => {
         components = createApiComponents(databaseUrl);
         server = createApiServer(components.dependencies);
-        server.listen(0, '127.0.0.1');
-        await once(server, 'listening');
+        await server.listen(0, '127.0.0.1');
 
         const address = server.address();
 

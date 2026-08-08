@@ -10,7 +10,7 @@ await migrateDatabase(config.databaseUrl);
 const components = createApiComponents(config.databaseUrl);
 const server = createApiServer(components.dependencies, {logger: true});
 
-server.listen(config.port);
+await server.listen(config.port);
 
 const shutdown = createGracefulShutdown({
     server,

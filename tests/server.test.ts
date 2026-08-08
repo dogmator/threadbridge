@@ -1,8 +1,10 @@
 import {randomUUID} from 'node:crypto';
 import {once} from 'node:events';
+import {setImmediate as nextTurn} from 'node:timers/promises';
 import {describe, expect, it} from 'vitest';
 import type {HttpErrorEnvelope} from '../apps/api/src/http-error.js';
 import {createApiServer, type ApiServerDependencies} from '../apps/api/src/server.js';
+import {createGracefulShutdown} from '../apps/api/src/shutdown.js';
 import {
     GetCommentReplies,
     GetPostComments,
@@ -92,8 +94,7 @@ const withApiServer = async (
 ): Promise<void> => {
     const server = createApiServer(dependenciesFor(requestIdFactory));
 
-    server.listen(0, '127.0.0.1');
-    await once(server, 'listening');
+    await server.listen(0, '127.0.0.1');
 
     try {
         const address = server.address();
@@ -111,6 +112,56 @@ const withApiServer = async (
 };
 
 describe('API server', () => {
+    it('rejects startup when the requested address is already in use', async () => {
+        const owner = createApiServer(dependenciesWith(randomUUID));
+
+        await owner.listen(0, '127.0.0.1');
+
+        try {
+            const address = owner.address();
+
+            if (address === null || typeof address === 'string') {
+                throw new Error('The owner server is not listening on a TCP port.');
+            }
+
+            const contender = createApiServer(dependenciesWith(randomUUID));
+
+            await expect(contender.listen(address.port, '127.0.0.1'))
+                .rejects.toMatchObject({code: 'EADDRINUSE'});
+            expect(contender.address()).toBeNull();
+        } finally {
+            owner.close();
+            await once(owner, 'close');
+        }
+    });
+
+    it('does not reopen the listener after shutdown begins following awaited startup', async () => {
+        const server = createApiServer(dependenciesWith(randomUUID));
+        const exitCodes: number[] = [];
+        let resourceClosures = 0;
+
+        await server.listen(0, '127.0.0.1');
+        const shutdown = createGracefulShutdown({
+            server,
+            closeResources: (): Promise<void> => {
+                resourceClosures += 1;
+                return Promise.resolve();
+            },
+            gracePeriodMs: 500,
+            writeDiagnostic: (): void => undefined,
+            setExitCode: (code): void => {
+                exitCodes.push(code);
+            },
+        });
+
+        await shutdown();
+        await nextTurn();
+
+        expect(server.address()).toBeNull();
+        expect(resourceClosures).toBe(1);
+        expect(exitCodes).toEqual([0]);
+    });
+
     it('answers GET /health with status 200', async () => {
         await withApiServer(async (baseUrl): Promise<void> => {
             const response = await fetch(`${baseUrl}/health`);

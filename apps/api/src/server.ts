@@ -25,15 +25,10 @@ export class ApiServer extends EventEmitter {
         fastify.server.on('close', (): void => {
             this.emit('close');
         });
-        fastify.server.on('error', (error: Error): void => {
-            this.emit('error', error);
-        });
     }
 
-    public listen(port: number, host = '0.0.0.0'): this {
-        void this.fastify.listen({port, host}).catch((error: unknown): void => {
-            this.emit('error', error);
-        });
+    public async listen(port: number, host = '0.0.0.0'): Promise<this> {
+        await this.fastify.listen({port, host});
         return this;
     }
 

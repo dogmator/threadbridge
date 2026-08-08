@@ -112,8 +112,7 @@ const withApiServer = async (use: (harness: Harness) => Promise<void>): Promise<
     };
     const server = createApiServer(dependencies);
 
-    server.listen(0, '127.0.0.1');
-    await once(server, 'listening');
+    await server.listen(0, '127.0.0.1');
 
     try {
         const address = server.address();
