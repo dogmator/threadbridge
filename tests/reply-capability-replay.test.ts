@@ -78,6 +78,7 @@ describe('reply capability changes', () => {
             },
         };
         const operations: ReplyPublicationOperationRepository = {
+            findExistingByParent: (): Promise<null> => Promise.resolve(null),
             begin: () => Promise.resolve({
                 kind: 'existing',
                 operation: {

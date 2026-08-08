@@ -177,11 +177,11 @@ describe('production boundary persistence', () => {
     it('does not delete an active projection when a provider page omits it', async () => {
         const contexts = new PostgresCommentReplyContextRepository(sql);
         const useCase = new GetPostComments(
-  new PostgresPublishedPostRepository(sql),
-  new Map([
-      [toSocialPlatform('demo'), new DemoSocialCommentsGateway()],
-  ]),
-  new PostgresCommentRepository(sql),
+            new PostgresPublishedPostRepository(sql),
+            new Map([
+                [toSocialPlatform('demo'), new DemoSocialCommentsGateway()],
+            ]),
+            new PostgresCommentRepository(sql),
         );
 
         const result = await useCase.execute({postId: secondPostId});
@@ -189,5 +189,4 @@ describe('production boundary persistence', () => {
         expect(result).toEqual({ok: true, value: {items: [], nextCursor: null}});
         expect(await contexts.findByCommentId(secondParentId)).not.toBeNull();
     });
-
 });

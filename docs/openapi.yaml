@@ -33,7 +33,8 @@ info:
     ## Transport limits
 
     The HTTP layer bounds untrusted input before any use case runs: request bodies are limited to
-    64 KiB measured in received bytes, an `Idempotency-Key` to 200 characters after trimming, reply
+    64 KiB measured in received bytes, an `Idempotency-Key` to 200 characters after HTTP field-value
+    parsing, reply
     content to 10,000 characters, and a cursor to 4,096 characters. Content is measured but never
     normalized or rewritten; the exact accepted string is what gets published and later compared.
   license:
@@ -46,7 +47,7 @@ servers:
 
 tags:
   - name: Health
-    description: Liveness of the service itself.
+    description: Liveness and PostgreSQL readiness of the service.
   - name: Comments
     description: Retrieval of comments and publication of replies.
 
@@ -64,6 +65,49 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HealthResponse'
+
+  /ready:
+    get:
+      tags: [Health]
+      summary: Readiness check
+      description: |
+        Reports whether PostgreSQL, the required local dependency for API operations, is reachable.
+        Provider availability is deliberately excluded: an external provider outage must not remove
+        an otherwise healthy API instance from service discovery or load-balancer rotation.
+      operationId: getReadiness
+      responses:
+        '200':
+          description: PostgreSQL is reachable and the service is ready to receive API traffic.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    const: ready
+              examples:
+                ready:
+                  value:
+                    status: ready
+        '503':
+          description: PostgreSQL is unavailable. No database error detail is exposed.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    const: unavailable
+              examples:
+                unavailable:
+                  value:
+                    status: unavailable
 
   /posts/{postId}/comments:
     get:
@@ -317,8 +361,9 @@ components:
       in: header
       required: true
       description: |
-        Client-chosen key identifying this publication attempt. It is trimmed and must be non-empty
-        and at most 200 characters after trimming. The same key is passed on to the provider.
+        Client-chosen key identifying this publication attempt. It must be non-empty and at most
+        200 characters after HTTP field-value parsing. ThreadBridge performs no additional
+        canonicalization and passes the accepted transport value to the provider unchanged.
       schema:
         type: string
         minLength: 1
@@ -460,18 +505,42 @@ components:
             provider payloads, credentials, database details, or stack traces.
         requestId:
           type: string
-          description: Identifier generated for this error response, useful for correlation.
+          description: Identifier generated for the request, useful for correlation.
 
     ErrorEnvelope:
       type: object
       additionalProperties: false
-      description: The single error envelope used by every failing request.
+      description: |
+        The error envelope used by application and transport failures. Operational readiness uses
+        its probe-specific status body instead.
       required: [error]
       properties:
         error:
           $ref: '#/components/schemas/ErrorDetail'
 
   responses:
+    RetrievalBadRequest:
+      description: |
+        The request was rejected by transport validation, or the selected provider rejected the
+        supplied cursor as invalid. Both outcomes use the public 400 error envelope.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          examples:
+            validationError:
+              value:
+                error:
+                  code: VALIDATION_ERROR
+                  message: Request validation failed
+                  requestId: 019fc3be-5155-7b43-aee4-63f580c05676
+            providerCursorInvalid:
+              value:
+                error:
+                  code: PLATFORM_CURSOR_INVALID
+                  message: Platform cursor is invalid
+                  requestId: 019fc3be-5155-7b43-aee4-63f580c05676
+
     ValidationError:
       description: |
         The request was rejected by the transport. Causes include a malformed UUID in the path, a

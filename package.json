@@ -3,16 +3,17 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "packageManager": "npm@11.12.1",
+  "packageManager": "npm@11.16.0",
   "engines": {
-    "node": "24.15.0",
-    "npm": "11.12.1"
+    "node": "24.18.1",
+    "npm": "11.16.0"
   },
   "workspaces": [
     "apps/*",
     "packages/*"
   ],
   "scripts": {
+    "build": "npm run build --workspace @threadbridge/comments && npm run build --workspace @threadbridge/api",
     "typecheck": "tsc --noEmit",
     "lint": "eslint . --max-warnings=0",
     "lint:fix": "eslint . --fix --max-warnings=0",
@@ -20,10 +21,10 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "@scalar/openapi-parser": "^0.28.12",
     "@types/node": "^24.13.3",
     "eslint": "^10.8.0",
     "jiti": "^2.7.0",
-    "tsx": "^4.23.4",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.65.0",
     "vitest": "^4.1.10"

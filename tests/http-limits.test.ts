@@ -2,10 +2,9 @@ import {randomUUID} from 'node:crypto';
 import {once} from 'node:events';
 import {request as httpRequest, type IncomingMessage} from 'node:http';
 import {connect} from 'node:net';
-import {Readable} from 'node:stream';
 import {describe, expect, it} from 'vitest';
 import type {HttpErrorEnvelope} from '../apps/api/src/http-error.js';
-import {MAX_REQUEST_BODY_BYTES, readBoundedBody} from '../apps/api/src/request-body.js';
+import {MAX_REQUEST_BODY_BYTES} from '../apps/api/src/router.js';
 import {createApiServer, type ApiServerDependencies} from '../apps/api/src/server.js';
 import {
     ok,
@@ -106,14 +105,14 @@ const withApiServer = async (use: (harness: Harness) => Promise<void>): Promise<
     const gateways = new Map<SocialPlatform, SocialCommentsGateway>([[demoPlatform, gateway]]);
     const dependencies: ApiServerDependencies = {
         requestIdFactory: requestIds.create,
+        checkReadiness: (): Promise<void> => Promise.resolve(),
         getPostComments: new GetPostComments(knownPost, gateways, noComments),
         getCommentReplies: new GetCommentReplies(noReplyContexts, gateways, noComments),
         replyToComment: new ReplyToComment(noReplyContexts, gateways, noComments),
     };
     const server = createApiServer(dependencies);
 
-    server.listen(0, '127.0.0.1');
-    await once(server, 'listening');
+    await server.listen(0, '127.0.0.1');
 
     try {
         const address = server.address();
@@ -223,15 +222,6 @@ const paddedBody = (bytes: number): string => {
 
 const envelopeOf = (raw: string): HttpErrorEnvelope => JSON.parse(raw) as HttpErrorEnvelope;
 
-/** A stream that reports whatever content length it likes, whatever it actually yields. */
-const fakeRequest = (chunks: readonly Buffer[], contentLength?: string): IncomingMessage => {
-    const stream = Readable.from(chunks);
-
-    return Object.assign(stream, {
-        headers: contentLength === undefined ? {} : {'content-length': contentLength},
-    }) as unknown as IncomingMessage;
-};
-
 /** Writes an intentionally unfinished HTTP/1.1 request and waits for the server to close it. */
 const unfinishedRequest = async (baseUrl: string, rawRequest: string): Promise<string> =>
     await new Promise<string>((resolve, reject): void => {
@@ -258,68 +248,6 @@ const unfinishedRequest = async (baseUrl: string, rawRequest: string): Promise<s
             resolve(Buffer.concat(received).toString('utf8'));
         });
     });
-
-describe('readBoundedBody', () => {
-    it('accepts a body of exactly the limit', async () => {
-        const body = await readBoundedBody(fakeRequest([Buffer.alloc(64, 0x61)]), 64);
-
-        expect(body).toEqual({kind: 'body', text: 'a'.repeat(64)});
-    });
-
-    it('rejects a body one byte over the limit', async () => {
-        const body = await readBoundedBody(fakeRequest([Buffer.alloc(65, 0x61)]), 64);
-
-        expect(body.kind).toBe('too-large');
-    });
-
-    it('measures UTF-8 bytes rather than JavaScript characters', async () => {
-        const accepted = await readBoundedBody(
-            fakeRequest([Buffer.from(`${'€'.repeat(21)}a`, 'utf8')]),
-            64,
-        );
-        const rejected = await readBoundedBody(fakeRequest([Buffer.from('€'.repeat(22), 'utf8')]), 64);
-
-        expect(accepted.kind).toBe('body');
-        expect(rejected.kind).toBe('too-large');
-    });
-
-    it('rejects an oversized body assembled from several chunks', async () => {
-        const chunks = [Buffer.alloc(40, 0x61), Buffer.alloc(40, 0x62)];
-
-        expect((await readBoundedBody(fakeRequest(chunks), 64)).kind).toBe('too-large');
-    });
-
-    it('enforces the limit on received bytes when the declared length lies', async () => {
-        const body = await readBoundedBody(fakeRequest([Buffer.alloc(200, 0x61)], '10'), 64);
-
-        expect(body.kind).toBe('too-large');
-    });
-
-    it('rejects a declared length over the limit before reading anything', async () => {
-        let read = false;
-        const request = {
-            headers: {'content-length': '999999'},
-            async *[Symbol.asyncIterator](): AsyncGenerator<Buffer> {
-                read = true;
-                await Promise.resolve();
-                yield Buffer.alloc(1);
-            },
-        } as unknown as IncomingMessage;
-
-        expect((await readBoundedBody(request, 64)).kind).toBe('too-large');
-        expect(read).toBe(false);
-    });
-
-    it('returns as soon as an oversized stream crosses the limit', async () => {
-        const body = await readBoundedBody(fakeRequest([Buffer.alloc(65, 0x61)]), 64);
-
-        expect(body.kind).toBe('too-large');
-    });
-
-    it('defaults to the 64 KiB transport limit', () => {
-        expect(MAX_REQUEST_BODY_BYTES).toBe(65_536);
-    });
-});
 
 describe('POST /comments media type', () => {
     it.each([
@@ -385,6 +313,26 @@ describe('POST /comments body size', () => {
 
             expect(response.status).not.toBe(413);
             expect(response.status).toBe(404);
+        });
+    });
+
+    it('measures the 64 KiB limit in UTF-8 bytes', async () => {
+        await withApiServer(async ({baseUrl, requestIds}): Promise<void> => {
+            const body = replyBody('€'.repeat(22_000));
+
+            expect(body.length).toBeLessThan(MAX_REQUEST_BODY_BYTES);
+            expect(Buffer.byteLength(body, 'utf8')).toBeGreaterThan(MAX_REQUEST_BODY_BYTES);
+
+            const response = await postRaw(
+                baseUrl,
+                {'content-type': 'application/json', 'idempotency-key': 'limits-key'},
+                body,
+            );
+            const envelope = envelopeOf(response.body);
+
+            expect(response.status).toBe(413);
+            expect(envelope.error.code).toBe('PAYLOAD_TOO_LARGE');
+            expect(requestIds.calls).toBe(1);
         });
     });
 

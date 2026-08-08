@@ -2,255 +2,261 @@
 
 ## Overview
 
-ThreadBridge uses a deliberately small Hexagonal Architecture.
+ThreadBridge is a deliberately small modular monolith using a simplified Hexagonal Architecture.
 
 ```text
-HTTP API
-    |
-    v
+Fastify HTTP adapter
+        |
+        v
 Application use cases
-    |
-    v
+        |
+        v
 Domain model and ports
-    |
-    v
+        |
+        v
 PostgreSQL and social-platform adapters
 ```
 
-[`SPECIFICATION.md`](../SPECIFICATION.md) is ThreadBridge's behavioral and architectural contract:
-it records the behavior the service commits to, project assumptions, design decisions, and
-non-goals. This document explains the intended implementation boundaries without redefining that
+[`SPECIFICATION.md`](../SPECIFICATION.md) is the behavioral and architectural contract. This
+document explains the implementation boundaries and runtime invariants without creating a second
 contract.
 
-## HTTP API
+ThreadBridge has one application deployable unit. PostgreSQL is a separate infrastructure service.
+No worker, broker, scheduler, outbox, or webhook runtime exists until concrete behavior requires it.
 
-The HTTP layer is responsible for:
+## HTTP boundary
 
-- parsing and validating transport input;
-- translating requests into application input;
-- mapping application results and errors to HTTP responses;
-- avoiding business rules and platform-specific branching.
+The Fastify adapter owns transport concerns only:
 
-A malformed path identifier is a transport concern: it is rejected as a validation error before any port is called, so a syntactically impossible identifier never reaches PostgreSQL. A well-formed identifier that simply does not exist is a core failure and is reported as not found. An unexpected exception from any dependency becomes one uniform internal error with a fresh request identifier and no detail of what failed.
+- path, header, query, and JSON-body validation;
+- request-body and field limits;
+- conversion into application input;
+- HTTP status, headers, DTOs, and safe error envelopes;
+- server-generated request correlation IDs;
+- liveness/readiness endpoints and structured request logging.
 
-### Bounded request reading
+Business rules and provider-specific branching do not belong here.
 
-The body of a publication request is read through a small reader that stops at 64 KiB. A
-`Content-Length` above the limit is refused before the first chunk, but that header is a client
-claim, so the limit is enforced on the bytes actually received: a wrong length and a chunked body
-that declares no length are bounded the same way. Once the limit is passed, buffering stops and
-what was already buffered is dropped; the `413` is written immediately. The connection is marked
-non-reusable and any unread bytes are then drained rather than stored, so an unfinished upload
-cannot delay the response or be parsed as a following request. The media type is checked before
-the body is read at all, so an unsupported type costs nothing and is handled by the same
-non-reusable-connection rule.
+A syntactically invalid identifier is rejected before an application port is called. A valid but
+unknown identifier becomes the corresponding core not-found failure. Unexpected dependency errors
+become one static `INTERNAL_ERROR` response; exception messages and infrastructure details are not
+returned to the client.
 
-Field limits — 200 characters for an idempotency key after trimming, 10,000 for content, 4,096 for
-a cursor — are transport-local too. None of them rewrites the input: content is measured, never
-normalized, and the exact accepted bytes are what is published and later compared. A cursor is only
-measured; it stays opaque and reaches the adapter unchanged.
+### Request limits and connection containment
+
+Fastify enforces a 64 KiB body limit on received bytes. `POST /comments` also checks the media type
+before the use case runs. An oversized body (`413`) or unsupported media type (`415`) makes the
+connection non-reusable and drains unread request bytes without buffering them, so leftover input
+cannot be parsed as another request on the connection.
+
+Transport-local field limits are 200 characters for an idempotency key after HTTP field-value
+parsing with no additional application canonicalization, 10,000 for
+reply content, and 4,096 for a cursor. Accepted content is never normalized or rewritten. Provider
+cursors remain opaque and reach the selected adapter unchanged.
+
+The request receive phase is bounded to 30 seconds. There is deliberately no generic application
+handler timeout around reply publication: returning a timeout while an external non-idempotent write
+continues would make the API claim an outcome it cannot know. Provider adapters must instead report
+typed retryable or indeterminate outcomes according to what the provider can prove.
+
+### Correlation and logging
+
+Fastify generates the correlation ID through the configured request-ID factory. Caller-provided
+`x-request-id` values do not become the trusted server request ID.
+
+Production request logs contain only the generated request ID, HTTP method, route template, response
+status, and elapsed time. Raw URLs and query strings, headers, bodies, credentials, and exception
+messages are deliberately excluded. Successful `/health` and `/ready` requests are omitted from
+completion logs; a failed readiness probe emits a sanitized warning.
+
+### Liveness and readiness
+
+`GET /health` is process liveness and does not depend on PostgreSQL or a provider.
+
+`GET /ready` executes a minimal PostgreSQL query. It returns `200` only when the database is usable
+and returns a detail-free `503` otherwise. Provider availability is intentionally not part of
+readiness: a provider outage must not remove every API instance from service discovery.
 
 ## Application layer
 
-Application use cases coordinate the required behavior:
+Application use cases coordinate behavior through typed ports:
 
-- retrieve root comments for a post;
-- retrieve direct replies to a comment;
-- publish a reply with idempotency.
+- `GetPostComments` retrieves one root-comment page;
+- `GetCommentReplies` retrieves one page of direct children;
+- `ReplyToComment` owns reply-publication orchestration and recovery.
 
-Application code depends on domain types and ports rather than concrete PostgreSQL or social-platform adapters. External platform calls must not be held inside database transactions.
+Application code depends on domain types and ports, not Fastify, PostgreSQL, provider SDKs, or
+container/runtime APIs. Provider names are not branch conditions in use cases. Adding a provider
+means implementing the existing gateway port and registering the adapter in the composition root.
 
-## Domain and ports
+External platform calls must never execute while a PostgreSQL transaction or lock is held.
 
-The domain defines normalized comment data, typed identifiers, results, errors, and the contracts required by the application layer.
+## Provider boundary
 
-Expected ports include:
+Each `SocialCommentsGateway` declares the operations it supports and whether reply publication has a
+provider-side idempotency guarantee. Provider DTOs, cursor formats, credentials, and raw failures stay
+inside the adapter.
 
-- comment persistence;
-- published-post and reply-context resolution;
-- social-platform comment operations.
+The demo gateways prove multiple capability shapes without credentials or network access. Their
+published data is in-memory fixture behavior; PostgreSQL durability does not turn those fixtures into
+a real provider. A production adapter queries the external source of truth and owns provider-specific
+timeouts and outcome classification.
 
-The domain must not depend on HTTP types, PostgreSQL clients, provider SDKs, or framework-specific abstractions.
+## Persistence
 
-## Adapters
+PostgreSQL stores the latest normalized comment projection and durable reply-publication operation
+state. The external platform remains the source of truth for published content and provider
+identifiers.
 
-PostgreSQL adapters maintain the local normalized projection.
+The comment hierarchy is an adjacency list. A composite foreign key enforces that a reply belongs to
+the same post as its parent while preserving arbitrary depth and null parents for root comments.
 
-Social-platform adapters:
+Comment imports upsert on external identity. The `version` column provides a verified
+compare-and-set persistence boundary, although no current edit command consumes it.
 
-- communicate with one concrete provider;
-- translate provider data into normalized domain data;
-- preserve provider cursors behind the adapter boundary;
-- translate provider failures into internal typed errors.
+### Connection lifecycle
 
-Application code must not branch on platform names. Adding a platform requires implementing the existing platform port and registering the adapter in the composition root.
+The API PostgreSQL client uses a five-second connection-establishment timeout and an explicit
+`application_name`. Shutdown closes the pool with a bounded deadline.
 
-The demo gateway exists to prove the port end to end without credentials or network access. Its
-fixtures are static and its published replies live in the memory of one adapter instance, so they
-are forgotten when the process restarts. Because retrieval reports what the platform returns, a
-reply published before a restart is no longer listed afterwards, while the local projection and the
-idempotency guarantees, which are owned by PostgreSQL, survive it. That asymmetry belongs to the
-demonstrational adapter and not to the architecture: a real adapter queries a platform that keeps
-its own history.
-
-## Persistence and consistency
-
-The external platform remains the source of truth for published comments and provider identifiers. PostgreSQL stores the latest known normalized projection.
-
-The comment hierarchy uses an adjacency-list relationship through a parent comment identifier. Root comments and direct replies are retrieved separately; recursively loading an arbitrary subtree is outside the current scope.
-
-Repeated synchronization of the same external comment must not create duplicates.
-
-### Migration history
-
-Migrations are plain numbered SQL files applied in filename order, each in its own transaction and
-each recorded with the SHA-256 checksum of the file that was applied. The recorded history is
-treated as evidence about a deployed schema, so the runner refuses to continue when that evidence
-stops matching the files: an edited migration, a migration that has disappeared from the directory,
-and a history that predates checksums but already records applied migrations are all reported and
-nothing further is applied. A checksum is never invented, rewritten, or deleted to make a run pass.
-
-The whole run is serialized across instances by one global advisory lock. The runner reserves a
-single connection, takes the lock on it, and holds it across history setup, validation, and every
-pending migration, so instances starting together cannot both execute the same DDL: the second one
-waits, then observes a completed history and applies nothing. The lock is session-scoped rather
-than transaction-scoped because each migration keeps its own transaction — obtaining a
-transaction-scoped lock would mean wrapping every migration in one giant transaction, trading a
-real guarantee for a worse one. Because the sequence must stay on the locked session, and the
-reserved handle of the checked-in client exposes no `begin`, each migration transaction is driven
-explicitly with `begin`/`commit`/`rollback`. The lock is released in a `finally`, whether the run
-succeeded, was rejected by validation, or failed inside a migration, and a failed release never
-replaces the error that caused it.
-
-### Parent and post consistency
-
-A reply belongs to the post its parent belongs to. That was previously only an application
-convention; it is now declared in the schema with a unique key on `(id, post_id)` and a composite
-self-referencing foreign key from `(parent_comment_id, post_id)`. The default MATCH SIMPLE
-semantics leave root comments unaffected, since their parent is null, while every reply is checked.
-Depth stays unrestricted, because a reply is checked against its own parent rather than a root.
-The constraint is a boundary guard, not an API surface: its violation is an internal error, never a
-detail returned to a client.
-
-### Optimistic locking
-
-Every comment row carries a `version`. It supports the standard compare-and-set pattern: an update
-that matches the expected version advances it, and an update carrying a stale expected version
-changes nothing. An integration test proves that behavior against the real `comments` table, and
-re-importing a known comment increments the version of the projection.
-
-No use case performs optimistic locking today. Editing and deletion are out of scope, so nothing
-supplies an expected version, and no versioned mutation port exists. The column and its verified
-behavior are the persistence-side boundary that such a command would build on.
+Statement and lock timeouts are deliberately not hard-coded as global application constants. Their
+safe values depend on representative query and migration workloads and on the production database
+or pooler topology. They belong to the deployment/database-role policy after measurement rather than
+to an arbitrary transport constant.
 
 ## Reply publication
 
-Reply publication is synchronous:
+Reply publication uses a durable operation before an external write.
 
-1. the transport validates the request body and the `Idempotency-Key` header;
-2. the reply context is resolved from the internal parent comment identifier;
-3. an existing comment is looked up by idempotency key;
-4. a match on parent and exact content replays the stored reply; any other match is a conflict;
-5. the platform adapter is resolved and called outside every database transaction;
-6. the confirmed reply is persisted by one short transaction that opens only afterwards;
-7. the persisted row is compared with the request once more, because a concurrent request may have
-   stored first;
-8. the reply is returned as created or as already existing.
+1. The transport validates `POST /comments` and passes the parent ID, exact content, and idempotency
+   key to `ReplyToComment`.
+2. The use case resolves the active parent comment context and provider gateway. If the projection
+   is no longer active, the parent derives its owning account for a narrow account-and-key lookup
+   that may replay an already completed operation; it never creates or resumes provider work
+   without an active context.
+3. `ReplyPublicationOperationRepository.begin` creates or loads the operation identified by
+   `(account_id, idempotency_key)` and compares its parent/request fingerprint.
+4. Conflicting key reuse returns `IDEMPOTENCY_CONFLICT` without a provider call.
+5. A `published` operation replays its stored comment.
+6. Before any repeated provider call, the use case searches for a comment already stored under the
+   account and key. If found, it marks the operation `published` and replays locally.
+7. `indeterminate` and terminal `failed` operations replay their recorded outcome without another
+   provider call.
+8. A `pending` operation reaches a provider again only when that provider declares native
+   publication idempotency. Otherwise it becomes `indeterminate` rather than risking a duplicate.
+9. The provider is invoked with no PostgreSQL transaction or lock held.
+10. A confirmed reply is stored in a short local transaction. Only afterwards is the durable
+    operation marked `published`.
+11. Provider failures are recorded as `retryable_failed`, `failed`, or `indeterminate` according to
+    the adapter's typed outcome.
 
-The same idempotency key with the same parent and the exact same content returns the existing
-result, and a sequential replay never calls the platform twice. Reusing the key with a different
-parent or different content produces a conflict.
+The operation table therefore owns durable request identity. The comment's optional idempotency key
+is a recovery index, not global request ownership and not globally unique; the same client-chosen key
+may be used by different connected accounts.
 
-### Idempotency and concurrency
+### Failure classification
 
-One local row exists per idempotency key: a partial unique index enforces it, and the publication
-transaction converges concurrent writers onto a single row rather than failing. Requests sharing a
-key are serialized by a transaction-scoped advisory lock derived from that key, so the key is
-claimed exactly once even if the platform answers two of them with different external comment
-identifiers.
+A timeout, rate limit, or temporary unavailability is `retryable_failed` only when the adapter can
+establish that no external write took effect. Authentication, permission, validation, unsupported
+operation, and confirmed missing-resource failures are terminal for the unchanged request. When the
+external side effect cannot be proven either way, the adapter reports
+`INDETERMINATE_PLATFORM_RESULT` and ThreadBridge does not perform a blind retry.
 
-The mirrored case is one external comment reached by two different keys, which happens when the
-platform deduplicates on its own side. PostgreSQL identifies one row there, so exactly one key can
-own it:
+If a provider reports that the parent resource no longer exists, the local projection can be marked
+deleted through the explicit projection-state port. That local update remains separate from the
+provider call.
 
-- a row imported by retrieval carries no key yet and adopts the requesting one, keeping its
-  internal identifier and its local creation timestamp;
-- a row already carrying the requesting key is returned as the existing result;
-- a row already carrying a different key keeps it. The request is not credited with a row it never
-  owned: it is reported as an idempotency conflict rather than as a successful replay, no duplicate
-  is written, and no database constraint error reaches the caller.
+Read-only operator diagnostics are documented in
+[`publication-operations.md`](./publication-operations.md).
 
-Neither the stored nor the requested key is ever exposed in a response.
+## Migrations
 
-### Provider idempotency versus local convergence
+Migrations are numbered SQL files applied in filename order. Before any lock or DDL, the runner
+verifies PostgreSQL 18+ because the schema uses the built-in `uuidv7()` function.
 
-The guarantee described above is local, and it is worth being precise about where it stops.
+One reserved connection holds a session advisory lock for the complete migration run. Each pending
+migration is then executed in its own transaction. Applied files are recorded with SHA-256 checksums.
+The runner fails closed when an applied file was modified or removed, or when existing history cannot
+be verified; it never rewrites history to make a run pass.
 
-PostgreSQL decides how many *rows* exist. It cannot decide how many *replies the platform created*,
-because the platform call deliberately happens outside every transaction and lock: holding one
-across a network call is exactly the failure mode this design refuses. Two concurrent requests
-sharing a key can therefore both reach the adapter, and only the provider can decide what the
-second one does.
+The application startup path runs migrations before creating the HTTP listener. The standalone
+compiled migration entry point uses the same `migrateDatabase` implementation, so deployment tooling
+can run migrations separately without maintaining a second migration contract.
 
-That is why the idempotency key is passed through to the adapter. An adapter forwards it as the
-provider's idempotency token, or relies on an equivalent provider guarantee; the demo adapter
-deduplicates on its own side and is externally idempotent, which is what its concurrency test
-proves. An adapter that cannot deduplicate externally must not be presented as exactly-once. What
-the application still guarantees in that case is unchanged: one row, one identifier, one result for
-both callers.
+Large-database and zero-downtime limitations are documented in [`migrations.md`](./migrations.md).
 
-Without provider idempotency, reservation states, reconciliation, or an outbox, an external call
-may also complete while its outcome stays unknown. That case is reported as a typed indeterminate
-result, nothing is persisted, and nothing is retried automatically. This is the intended current
-behavior, not an omission.
+## Process and container lifecycle
 
-### Why no transaction manager
+The production image runs compiled JavaScript directly with Node.js as PID 1. There is no shell
+wrapper in the normal runtime command. Startup performs migrations in the same Node process before
+the API components are created and before the listener opens.
 
-Every implemented write is owned by one adapter and is atomic as seen by the application, so no use
-case needs to compose two writes. The external call happens before persistence and never runs
-inside a transaction, which is precisely what a transaction manager must not be allowed to make
-easy. An abstraction is added when behavior requires it.
+The final image runs as the non-root `node` user and contains only production dependencies, compiled
+application artifacts, package metadata, and migration SQL. It does not contain source TypeScript,
+tests, `tsx`, or other dev-only dependencies.
+
+CI proves the runtime starts with a read-only root filesystem, all Linux capabilities dropped, and
+`no-new-privileges`. The local Compose definition mirrors those restrictions and provides a small
+`/tmp` tmpfs for runtime compatibility.
+
+Base images are pinned by version and digest. The digest makes an identical repository commit build
+against the same base artifact; it does not replace vulnerability scanning or periodic security
+repinning.
 
 ## Shutdown
 
-One idempotent routine handles `SIGTERM` and `SIGINT`. A second signal joins the run already in
-progress instead of starting a competing one, and the routine never rejects, because a signal
-handler has nowhere to report a rejection to.
+One idempotent routine handles `SIGTERM` and `SIGINT`. A second signal joins the existing shutdown
+instead of starting competing cleanup.
 
-The order is fixed. The server stops accepting connections, idle keep-alive connections are closed
-at once — they hold no request and would otherwise keep the server open for the whole grace period
-— and connections still serving a request get five seconds. If the server has not closed by then,
-the remaining connections are force-closed. PostgreSQL is closed only after the HTTP server has
-stopped or been forced, and it is closed even when stopping the server failed, because leaving a
-pool open is worse than a partially closed server.
+Shutdown order is deliberate:
 
-A clean shutdown sets exit code 0. A failure writes one static diagnostic to stderr — deliberately
-static, since a shutdown error can carry a connection string — and sets exit code 1. The process
-exit code is set rather than `process.exit` being called, so pending work is not cut off, and the
-deadline timer is always cleared so nothing keeps the loop alive.
+1. stop accepting new HTTP connections;
+2. close idle keep-alive connections immediately;
+3. allow active HTTP work up to five seconds;
+4. force-close remaining HTTP connections after that deadline;
+5. close PostgreSQL resources with their own bounded five-second window.
+
+A clean shutdown sets exit code `0`. A failure writes one static diagnostic that cannot leak a
+connection string and sets exit code `1`. `process.exit()` is not used.
+
+Because the two bounded phases can consume up to ten seconds sequentially, the local Compose
+scheduler gives the application 15 seconds before forced termination. Production schedulers must
+provide at least the same termination budget.
 
 ## Dependency direction
 
 Dependencies point inward:
 
-- domain code has no infrastructure dependencies;
-- application code depends on ports;
+- domain code depends only on domain code;
+- ports may depend on domain types, never application or infrastructure;
+- application code depends on domain and ports;
 - adapters implement ports;
-- the composition root creates and connects concrete implementations.
+- the composition root creates concrete adapters and use cases.
 
-Dependencies are supplied explicitly through constructor injection. Mutable global state and Service Locator patterns are not used.
+These boundaries are enforced by type-aware ESLint import restrictions. Mutable global state,
+Service Locator, Generic Repository, and Active Record patterns are not used.
 
-## Deliberate constraints
+## Asynchronous evolution
 
-The project avoids speculative infrastructure and abstractions, including:
+The current application is synchronous. A future scheduler, webhook receiver, or background
+coordinator must invoke the same application use cases or narrow ports, persist durable cursors or
+checkpoints in PostgreSQL, and keep provider calls outside database transactions.
 
-- Generic Repository;
-- Active Record in the application layer;
-- provider conditionals in use cases;
-- background workers;
-- message brokers;
-- Transactional Outbox;
-- webhook ingestion;
-- automatic polling and reconciliation.
+Splitting that coordinator into another process is a later deployment decision. ThreadBridge does
+not prebuild a worker service, message broker, Transactional Outbox, scheduler abstraction, webhook
+infrastructure, polling tables, or a universal event model before concrete behavior requires it.
 
-These remain possible extension points rather than current implementation requirements.
+## Deliberate non-goals
+
+The current project deliberately does not implement:
+
+- authentication or authorization;
+- provider credential management;
+- deployment-wide TLS/ingress and abuse/rate-limit policy;
+- metrics or distributed tracing;
+- automatic polling, webhooks, reconciliation, or background workers;
+- message brokers or Transactional Outbox;
+- recursive loading of an entire comment subtree;
+- a generic transaction manager around external calls.
+
+Those are deployment or future-product concerns, not hidden guarantees of the current service.

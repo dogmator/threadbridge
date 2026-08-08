@@ -2,114 +2,110 @@
 
 ## 0. Status of this document
 
-This is ThreadBridge's **behavioral and architectural contract**. It describes the capabilities the
-service provides, the project assumptions behind its implementation, and the constraints its tests
+This is ThreadBridge's **behavioral and architectural contract**. It records the capabilities the
+service provides, the design decisions the implementation depends on, and the boundaries its tests
 and reviews enforce.
 
-ThreadBridge retrieves comments for published posts, publishes replies, supports multiple social
-platforms through a common application-facing contract, and exposes those capabilities through a
-REST API. The repository also contains the schema, API design, TypeScript implementation, design
-rationale, project assumptions, and AI-use disclosure for the service.
+ThreadBridge retrieves comments for published social-media posts, publishes replies, supports
+multiple social platforms through a common application-facing contract, and exposes those
+capabilities through a REST API.
 
-PostgreSQL, UUID v7 identifiers, cursor-based pagination, direct-reply retrieval, publication
-idempotency keys, optimistic-locking versions, checksum-verified migrations, transport limits, and
-graceful shutdown are project design decisions. The reasoning behind each decision and the trade-off
-accepted for it are summarized in the README under *Assumptions and trade-offs*.
-
-Where this document says "must", it states a ThreadBridge contract enforced by the
-implementation and tests.
+Where this document says **must**, it states a ThreadBridge contract rather than an implementation
+suggestion.
 
 ## 1. Purpose
 
-ThreadBridge is a platform-independent TypeScript service for retrieving comments from published social-media posts and publishing replies through a unified REST API.
+ThreadBridge is a platform-independent TypeScript service for retrieving comments from published
+social-media posts and publishing replies through a unified REST API.
 
-The project is intentionally small. It demonstrates clear architectural boundaries, strong type safety, extensibility, and pragmatic engineering decisions without introducing infrastructure that current behavior does not require.
+The project is intentionally small. It favors explicit boundaries, strict types, fail-closed
+persistence/migration behavior, and testable operational properties over speculative infrastructure.
 
 ## 2. Capabilities
 
-### 2.1 Core capabilities
-
 The system must:
 
-- retrieve comments for a published post;
+- retrieve root comments for a published post;
+- retrieve direct replies to a comment;
 - publish a reply to an existing comment;
 - support multiple social platforms through a common application-facing contract;
-- expose the functionality through a REST API.
-
-### 2.2 Project design decisions
-
-These extend the core capabilities above and are binding project decisions:
-
-- retrieve direct replies to a comment, so a thread can be walked one level at a time;
+- expose those capabilities through a REST API;
 - persist a normalized local projection in PostgreSQL;
-- support cursor-based pagination;
-- prevent duplicate local reply creation through idempotency;
-- allow a new platform adapter to be added without changing application use cases.
-
-One demonstrational social-platform adapter is sufficient for the current implementation.
+- support opaque cursor pagination;
+- maintain durable account-scoped reply-publication identity and recovery;
+- allow a provider adapter to be added without changing application use cases.
 
 ## 3. Scope and non-goals
 
 The current implementation is synchronous and deliberately minimal.
 
-The following are outside the current scope:
+The following are outside the current product/runtime scope:
 
 - user authentication and authorization;
-- comment editing and deletion;
-- webhooks;
+- production credential management;
+- comment editing through the public API;
+- webhook ingestion;
 - background workers;
 - message brokers;
 - Transactional Outbox;
-- automatic polling and reconciliation;
-- automatic retry after an indeterminate external result;
+- automatic polling or reconciliation;
+- automatic retry after an indeterminate external write;
 - complete comment revision history;
 - recursive retrieval of an entire comment subtree;
-- production credential management;
-- production observability and autoscaling.
+- metrics, distributed tracing, and autoscaling policy;
+- deployment-wide TLS/ingress and abuse/rate-limit policy.
 
-These components must not be introduced until implemented behavior requires them.
+These concerns must not be disguised as implemented guarantees. Infrastructure or abstractions for
+them are introduced only when concrete behavior requires them.
 
 ## 4. Architecture
 
-ThreadBridge uses a simplified Hexagonal Architecture:
+ThreadBridge is one modular-monolith application deployable using a simplified Hexagonal
+Architecture:
 
 ```text
-HTTP API
-   ↓
+Fastify HTTP adapter
+        ↓
 Application use cases
-   ↓
+        ↓
 Domain model and ports
-   ↓
+        ↓
 PostgreSQL and social-platform adapters
 ```
 
+PostgreSQL is separate infrastructure. There is no worker application in the current scope.
+
 ### Architectural rules
 
-- The HTTP layer validates input, converts DTOs, and produces HTTP responses.
+- The HTTP layer owns transport validation, DTO mapping, status/headers, request correlation,
+  liveness/readiness, and HTTP logging.
 - Application use cases coordinate system behavior.
-- Domain and application code do not depend on HTTP, PostgreSQL, ORM libraries, or platform SDKs.
-- PostgreSQL and social platforms are accessed through typed ports.
-- Platform-specific DTOs, cursors, and errors remain inside platform adapters.
-- Dependencies are supplied explicitly through constructor injection.
-- Concrete dependencies are assembled in a composition root.
-- Application code must not branch on concrete platform names.
-- Adding a platform requires a new `SocialCommentsGateway` implementation and registration.
-- Each gateway must declare the operations and publication-idempotency guarantee it supports.
-- External platform calls must never execute inside a PostgreSQL transaction.
-- Abstractions are introduced only when supported by current behavior.
-- Simple duplication is preferable to a premature generic abstraction.
+- Domain and application code must not depend on Fastify, PostgreSQL, container APIs, or provider
+  SDKs.
+- PostgreSQL and providers are accessed through typed ports.
+- Provider DTOs, cursors, credentials, and raw errors must remain inside provider adapters.
+- Dependencies are supplied explicitly through constructor injection and assembled in a composition
+  root.
+- Application code must not branch on concrete provider names.
+- Each provider gateway must declare supported operations and its publication-idempotency guarantee.
+- External provider calls must never execute inside a PostgreSQL transaction or while a PostgreSQL
+  lock is held for that operation.
+- Abstractions are introduced only when current behavior justifies them.
+- Simple explicit code is preferable to a generic abstraction that does not reduce complexity or
+  risk.
 
 ## 5. Data ownership
 
 The social platform remains the source of truth for:
 
 - published comment content;
-- external identifiers;
-- external creation timestamps.
+- provider identifiers;
+- provider creation timestamps.
 
-PostgreSQL stores the latest known normalized local projection.
+PostgreSQL stores the latest known normalized projection and ThreadBridge-owned durable operation
+state.
 
-Domain and application logic must not depend on the shape of platform-specific metadata.
+Domain and application logic must not depend on provider-specific metadata shape.
 
 ## 6. Data model
 
@@ -118,24 +114,15 @@ The minimum PostgreSQL schema contains:
 - `accounts`;
 - `posts`;
 - `comments`;
+- `reply_publication_operations`;
 - `schema_migrations`.
 
-Identifiers generated by ThreadBridge use UUID v7. That is an engineering decision: time-ordered
-keys keep index locality without exposing a countable sequence, and PostgreSQL 18 generates them
-natively.
+Identifiers generated by ThreadBridge use UUID v7. PostgreSQL 18 is the minimum supported database
+release because the checked-in schema uses its built-in `uuidv7()`.
 
 ### `accounts`
 
-Stores a connected social-platform account:
-
-- internal identifier;
-- platform type;
-- external account identifier;
-- optional credential reference or test configuration;
-- creation timestamp;
-- update timestamp.
-
-Required uniqueness:
+A connected provider account. Required uniqueness:
 
 ```text
 (platform, external_account_id)
@@ -143,16 +130,7 @@ Required uniqueness:
 
 ### `posts`
 
-Stores a published post:
-
-- internal identifier;
-- account identifier;
-- external post identifier;
-- publication timestamp;
-- creation timestamp;
-- update timestamp.
-
-Required uniqueness:
+A published post belonging to one account. Required uniqueness:
 
 ```text
 (account_id, external_post_id)
@@ -160,35 +138,76 @@ Required uniqueness:
 
 ### `comments`
 
-Stores the latest known normalized state of a comment:
+Stores the latest known normalized comment projection, including internal/post/parent identity,
+external comment and author identifiers, content, provider/local timestamps, optimistic-locking
+version, optional publication-recovery idempotency key, projection state, observation/deletion state,
+and optional provider metadata.
 
-- internal identifier;
-- post identifier;
-- optional parent comment identifier;
-- external comment identifier;
-- external author identifier;
-- content;
-- platform creation timestamp;
-- local creation timestamp;
-- local update timestamp;
-- optimistic-locking version;
-- optional idempotency key;
-- optional platform-specific JSON metadata.
+A reply is an ordinary comment with `parent_comment_id`. Depth is unrestricted.
 
-A reply is represented as a normal comment with `parent_comment_id`.
-
-Comment depth is not restricted by the data model.
-
-Required uniqueness:
+Required external identity uniqueness:
 
 ```text
 (post_id, external_comment_id)
-idempotency_key, when present
 ```
 
-A reply must belong to the same post as its parent. The invariant is declared in the schema through a unique key on `(id, post_id)` and a composite self-referencing foreign key from `(parent_comment_id, post_id)`, so a cross-post parent is rejected by PostgreSQL rather than only by application code. Root comments, whose parent is null, are unaffected, and reply depth stays unrestricted.
+The optional comment `idempotency_key` is an account-scoped recovery lookup when joined through the
+owning post. It is not globally unique and does not own durable request identity.
+
+A reply must belong to the same post as its parent. PostgreSQL enforces this with the checked-in
+composite self-reference rather than relying only on application convention.
+
+### `reply_publication_operations`
+
+Owns durable reply-publication request identity and lifecycle state:
+
+- internal operation ID;
+- account ID;
+- parent comment ID;
+- idempotency key;
+- request fingerprint;
+- status;
+- optional stored comment ID;
+- optional last failure code;
+- creation/update timestamps.
+
+Supported statuses are:
+
+```text
+pending
+published
+retryable_failed
+failed
+indeterminate
+```
+
+Required identity uniqueness:
+
+```text
+(account_id, idempotency_key)
+```
+
+A `published` operation must reference a stored comment. Failure-state operations must carry the
+failure code required by the checked-in schema invariant.
 
 ## 7. REST API
+
+### Liveness
+
+```http
+GET /health
+```
+
+Returns process liveness and must not depend on PostgreSQL or a provider.
+
+### Readiness
+
+```http
+GET /ready
+```
+
+Runs a minimal PostgreSQL readiness check. It returns `200` with `{ "status": "ready" }` or a
+safe `503` with `{ "status": "unavailable" }`. Provider availability is not part of readiness.
 
 ### Retrieve root comments
 
@@ -204,9 +223,7 @@ Returns one page of root comments for the selected post.
 GET /comments/:commentId/replies?cursor=<opaque-cursor>
 ```
 
-Returns one page of direct children of the selected comment.
-
-The endpoint does not recursively return the complete subtree.
+Returns one page of direct children. It does not recursively return an arbitrary subtree.
 
 ### Publish a reply
 
@@ -225,128 +242,76 @@ Request body:
 }
 ```
 
-Expected behavior:
+A newly published reply returns `201`. An identical replay returns the existing resource with `200`.
+Conflicting reuse of the same account-scoped key returns `409`.
 
-- a newly published reply returns `201 Created`;
-- a repeated request with the same idempotency key and identical input returns the existing resource;
-- reusing the same key with different input returns `409 Conflict`.
+### Pagination
 
-### Page response
+Page responses contain `items` and an opaque `nextCursor`. Provider cursor internals must not become
+a public API contract. An adapter must reject a cursor it cannot validate as one of its own tokens.
 
-```json
-{
-  "items": [],
-  "nextCursor": null
-}
-```
+The authoritative machine-readable transport contract is `docs/openapi.yaml`.
 
-The cursor is opaque to API clients. It may encapsulate a platform cursor or stable continuation parameters.
+## 8. Retrieval behavior
 
-## 8. Comment retrieval behavior
+For retrieval, the application:
 
-For a retrieval request, the application:
+1. resolves the post/comment context and owning provider;
+2. invokes the provider outside PostgreSQL transactions;
+3. converts provider DTOs to normalized comments inside the adapter/application boundary;
+4. upserts the normalized projection in PostgreSQL;
+5. returns the normalized page and opaque continuation cursor.
 
-1. loads the post and its account;
-2. resolves the registered platform adapter;
-3. requests one page from the external platform;
-4. converts platform DTOs into normalized comments;
-5. saves the comments idempotently in PostgreSQL;
-6. returns the normalized page and an opaque next cursor.
-
-The API retrieves either root comments or direct replies. It does not load or paginate an arbitrary complete subtree.
+The public response is built from the provider result, not served as a stale page from the local
+projection.
 
 ## 9. Reply publication behavior
 
 For `POST /comments`, the application:
 
-1. validates the request body and `Idempotency-Key` header;
-2. loads the parent comment, post, and account;
-3. checks whether the idempotency key was already used;
-4. returns the existing comment when the key and input match;
-5. returns an idempotency conflict when the same key was used with different input;
-6. resolves the social-platform adapter;
-7. invokes the external platform outside a PostgreSQL transaction;
-8. saves the confirmed reply in a short PostgreSQL transaction;
-9. returns the created resource.
+1. validates transport input and the idempotency key;
+2. resolves the active parent comment context and selected provider gateway; if the projection is
+   no longer active, the parent derives its owning account so an existing completed operation may
+   still replay by account and key, but no new or retryable provider work starts;
+3. creates or loads the durable operation by account and key;
+4. compares parent identity and request fingerprint;
+5. rejects conflicting key reuse without calling the provider;
+6. replays a `published` operation locally;
+7. before any repeated provider call, checks whether a matching reply was already stored and, if so,
+   completes the operation locally;
+8. replays `indeterminate` and terminal `failed` outcomes without another provider call;
+9. refuses an unsafe repeat of a `pending` operation when the provider has no publication-idempotency
+   guarantee;
+10. invokes the provider with no PostgreSQL transaction or operation lock held;
+11. persists a confirmed reply in a short PostgreSQL transaction;
+12. marks the durable operation `published` only after the reply is stored;
+13. otherwise records the classified failure state.
 
-The current implementation does not automatically retry an operation when the external result is indeterminate and the platform does not guarantee idempotency.
+### Local and external idempotency
 
-### Scope of the idempotency guarantee
+ThreadBridge guarantees one durable operation for `(account_id, idempotency_key)` and uses the
+request fingerprint to distinguish a replay from conflicting reuse.
 
-Two guarantees are involved, and only one of them belongs to this application.
+Only the provider can guarantee that two calls carrying the same key create at most one external
+reply. An adapter advertising native publication idempotency must forward or implement an equivalent
+provider guarantee. An adapter without that guarantee must not receive a blind repeat from an
+existing `pending` operation.
 
-The *local* guarantee is owned by ThreadBridge and is unconditional: at most one comment row exists per idempotency key, concurrent requests carrying one key converge on that row and report the same identifier, a repeated request with identical input replays it, and the same key with different input is a conflict. It is enforced by a partial unique index and a transaction-scoped advisory lock taken after the platform has answered.
+### Failure states
 
-The *external* guarantee — that one key produces at most one reply on the social platform — can only be given by the platform. The application deliberately holds no database transaction and no lock across the external call, so two concurrent requests sharing a key may both reach the adapter. The idempotency key is passed to the adapter for exactly that reason: an adapter forwards it as the provider's idempotency token, or otherwise relies on an equivalent provider guarantee. The demo adapter deduplicates on its own side and is therefore externally idempotent. An adapter that cannot do this must not be described as exactly-once, and must report `INDETERMINATE_PLATFORM_RESULT` when it cannot tell whether the external write happened.
+- `retryable_failed`: the adapter reported a temporary failure and can establish that no external
+  write took effect.
+- `failed`: the unchanged request has a terminal provider failure.
+- `indeterminate`: ThreadBridge cannot prove whether the external write happened; no blind retry is
+  allowed.
 
-Migration execution is serialized across application instances by a global advisory lock, so several instances starting together apply pending migrations exactly once.
+A timeout is not automatically retryable. When the external side effect is unknown, the adapter must
+report `INDETERMINATE_PLATFORM_RESULT`.
 
-## 10. Application ports
+Provider-resource-not-found can also mark the corresponding local projection deleted through the
+explicit projection-state port; that local write remains separate from the provider call.
 
-The minimum application-facing contracts are conceptually equivalent to:
-
-```ts
-interface CommentRepository {
-    findByIdempotencyKey(key: IdempotencyKey): Promise<Comment | null>;
-    savePublishedReply(
-        reply: PublishedReply,
-    ): Promise<SavePublishedReplyResult>;
-    saveMany(
-        comments: readonly NormalizedComment[],
-    ): Promise<readonly Comment[]>;
-}
-
-interface PublishedPostRepository {
-    findContextByPostId(
-        postId: PostId,
-    ): Promise<PublishedPostContext | null>;
-}
-
-interface CommentReplyContextRepository {
-    findByCommentId(
-        commentId: CommentId,
-    ): Promise<CommentReplyContext | null>;
-}
-
-interface SocialCommentsCapabilities {
-    readonly rootComments: boolean;
-    readonly directReplies: boolean;
-    readonly replyPublication: boolean;
-    readonly publicationIdempotency: 'native' | 'none';
-}
-
-interface SocialCommentsGateway {
-    readonly capabilities: SocialCommentsCapabilities;
-    getComments(
-        input: GetPlatformCommentsInput,
-    ): Promise<Result<PlatformCommentPage, PlatformFailure>>;
-    getReplies(
-        input: GetPlatformRepliesInput,
-    ): Promise<Result<PlatformCommentPage, PlatformFailure>>;
-    replyToComment(
-        input: ReplyToPlatformCommentInput,
-    ): Promise<Result<
-        PlatformComment,
-        PlatformFailure | IndeterminatePlatformResultFailure
-    >>;
-}
-```
-
-The persistence port has no retrieval methods, because the platform owns published content: a page of comments is read from the platform and then projected locally, never read back from the projection. Deciding which platform a request belongs to is a separate and deliberately narrow responsibility, so one port resolves the platform binding of a published post and another resolves the reply context of a comment. Neither is a generic repository, and neither is reused as one.
-
-Internal identity, optimistic-locking versions, and local timestamps are owned by the store. A persistence operation that assigns or preserves internal identity therefore returns the persisted entities rather than `void`, so the caller reports the same state that was stored.
-
-Platform gateways report expected failures as typed results rather than exceptions, so the application handles every declared failure mode exhaustively.
-
-A publication operation reports whether it created a row or converged on one an earlier request had already stored, so the transport can answer `201 Created` or `200 OK` without inspecting persistence details.
-
-Every implemented write is owned by its adapter and is atomic as seen by the application: importing a page upserts on external identity, and publishing a reply runs one short transaction that opens only after the platform has already answered. No application-visible transaction manager exists, because no use case composes two writes that must succeed or fail together. One is introduced only when behavior requires it.
-
-The `version` column supports optimistic compare-and-set persistence: an update that matches the expected version advances it, while an update carrying a stale expected version changes nothing. That schema behavior is verified by an integration test against the real `comments` table. Re-importing a comment that is already known locally increments the version of the projection.
-
-Comment editing and deletion are out of scope, so no current command lets a caller supply an expected version, and no versioned mutation port exists. Such a port is defined by the command that needs it rather than added in advance.
-
-A platform registry may be represented by a typed read-only map. A dedicated registry class is unnecessary until registry-specific behavior appears.
+## 10. Ports and dependency direction
 
 The primary application use cases are:
 
@@ -354,179 +319,210 @@ The primary application use cases are:
 - `GetCommentReplies`;
 - `ReplyToComment`.
 
-External DTOs must not cross the boundary of their platform adapter.
+Required port responsibilities include:
 
-## 11. Errors
+- comment projection persistence and publication-recovery lookup;
+- published-post and reply-context resolution;
+- durable reply-publication operation persistence;
+- explicit projection-state updates;
+- provider comment retrieval/reply publication with declared capabilities.
 
-The REST API uses one error envelope:
+Ports remain narrow. No Generic Repository, Service Locator, Active Record, or global transaction
+manager is introduced.
+
+Dependencies point inward:
+
+- domain → domain only;
+- ports → domain;
+- application → domain + ports;
+- adapters → ports/infrastructure;
+- composition root → concrete implementations.
+
+Type-aware ESLint restrictions enforce the core import direction.
+
+## 11. HTTP errors and untrusted input
+
+Ordinary API failures use one safe envelope:
 
 ```json
 {
   "error": {
     "code": "COMMENT_NOT_FOUND",
     "message": "Comment was not found",
-    "requestId": "019..."
+    "requestId": "..."
   }
 }
 ```
 
-### Transport limits
+The HTTP layer owns static safe client-facing messages. Core failures remain machine-readable and
+HTTP-independent. Raw provider payloads, credentials, access tokens, SQL details, and exception
+messages must not be returned to clients.
 
-The HTTP layer bounds untrusted input before any use case runs:
+Transport limits:
 
 ```text
 request body            64 KiB, measured in received bytes
-Idempotency-Key         200 characters after trimming
+Idempotency-Key         200 characters after HTTP field-value parsing; no additional application canonicalization
 reply content           10,000 characters
 cursor                  4,096 characters
+request receive phase   30 seconds
 ```
 
-`POST /comments` requires the `application/json` media type, compared case-insensitively and accepting parameters such as a charset. Accepted content is never normalized or rewritten: whitespace decides only whether content is empty, and the exact bytes accepted are what gets published and compared for idempotency.
+`POST /comments` accepts `application/json` case-insensitively and permits media-type parameters.
+Accepted content is not normalized. `413` and `415` responses make the connection non-reusable and
+drain unread bytes without buffering them.
 
-Required error categories include:
+Fastify generates the trusted server request ID. Caller-provided `x-request-id` values do not replace
+it.
 
-- validation error;
-- unsupported media type;
-- payload too large;
-- comment not found;
-- post not found;
-- unsupported platform;
-- platform authentication failure;
-- platform rate limit exceeded;
-- platform unavailable;
-- idempotency conflict;
-- indeterminate platform result;
-- internal error.
+## 12. Observability contract
 
-Validation, unsupported media type, payload too large, internal error, and unknown route are transport-local: they are produced by the HTTP layer, never become application failures, and are not part of the core failure union.
+When runtime logging is enabled, request completion logs are structured JSON and contain only the
+server request ID, method, route template, status code, and elapsed time. Raw URL/query strings,
+headers, request bodies, credentials, and exception messages must not be emitted by this normal
+request logging path.
 
-Application and domain failures are machine-readable: each carries its error code and the structured
-fields that identify the failure, and never a client-facing message. The HTTP layer owns the mapping
-from an error code to its status and to its safe, static client-facing message, and it generates the
-`requestId`. Structured failure fields stay inside the application unless a mapping deliberately
-exposes them.
+Successful `/health` and `/ready` probes are intentionally quiet. A failed readiness check emits a
+sanitized warning. Unexpected request failures log only safe classification fields before returning a
+static internal-error envelope.
 
-Platform adapters translate external failures into internal typed errors.
+Metrics and distributed tracing are not implemented by this repository.
 
-Raw platform payloads, access tokens, credentials, and sensitive external details must never be returned to API clients.
+## 13. PostgreSQL and migrations
 
-## 12. TypeScript and code-quality requirements
+### Connection lifecycle
 
-The project uses strict TypeScript and strict ESLint rules.
+API and migration connections use a five-second connection-establishment timeout and distinct
+`application_name` values. API pool shutdown is bounded.
 
-Required principles:
+A universal statement/lock timeout is not hard-coded. Production database-role/pooler policy must
+choose those values after measuring representative workloads; arbitrary application constants must
+not silently redefine valid query behavior.
+
+### Migration history
+
+The migration runner must:
+
+- verify PostgreSQL 18+ before taking its migration lock or executing DDL;
+- reserve one connection and serialize the whole run with a session advisory lock;
+- apply migration files in deterministic filename order;
+- execute each migration in its own transaction;
+- record SHA-256 checksums;
+- reject modified or missing applied files;
+- reject unverifiable legacy history rather than inventing a checksum;
+- release the reserved session and lock on success or failure without replacing the original error.
+
+The application startup path applies pending migrations before opening the HTTP listener. The
+standalone compiled migration entry point must reuse the same migration implementation.
+
+Large-database and zero-downtime constraints are deployment-specific and are documented in
+`docs/migrations.md`.
+
+## 14. Runtime and container contract
+
+The production image must:
+
+- run compiled JavaScript rather than TypeScript-on-the-fly;
+- use the pinned Node.js runtime as PID 1;
+- run as a non-root user;
+- omit `tsx`, TypeScript sources, tests, and dev dependencies from the final runtime image;
+- apply migrations before the API listener opens;
+- handle `SIGTERM`/`SIGINT` through the bounded shutdown path;
+- remain functional with a read-only root filesystem, all Linux capabilities dropped, and
+  `no-new-privileges`.
+
+Node and PostgreSQL image bases are pinned by version and digest for reproducibility. Digest pins do
+not remove the requirement for periodic vulnerability scanning and security repinning.
+
+`compose.yaml` is a local/demo environment. Its demonstrational database credentials and published
+host database port are not a production deployment policy.
+
+## 15. Shutdown
+
+Shutdown is idempotent. It must:
+
+1. stop accepting new HTTP connections;
+2. close idle keep-alive connections immediately;
+3. give active HTTP work up to five seconds;
+4. force-close remaining HTTP connections after that deadline;
+5. close PostgreSQL resources within a separate bounded five-second phase;
+6. set exit code `0` on clean completion or `1` with a static non-secret diagnostic on failure.
+
+The process must not call `process.exit()` to cut off pending cleanup. A scheduler must provide more
+than the combined ten-second worst-case shutdown budget; the checked-in Compose configuration uses
+15 seconds.
+
+## 16. TypeScript and quality requirements
+
+The project uses strict TypeScript and type-aware ESLint. Required practices include:
 
 - no `any`;
-- external input enters the system as `unknown` and is runtime-validated;
-- branded types for identifiers where they improve safety;
-- `readonly` for immutable data;
-- discriminated unions for results and errors;
-- exhaustive state handling;
+- unknown external input is runtime-validated at the boundary;
+- branded identifiers where useful;
+- readonly immutable data;
+- discriminated unions and exhaustive failure/state handling;
 - explicit return types;
-- constructor dependency injection;
-- composition over inheritance;
-- no mutable global singletons;
-- no Service Locator;
-- no Generic Repository abstraction;
-- no Active Record in the application layer;
-- no base classes without shared behavior;
-- no abstractions created solely for hypothetical future use.
+- no unsafe non-null assertions;
+- no floating promises;
+- no mutable global singleton state;
+- no JavaScript project/source files;
+- no TODO/FIXME/HACK comments admitted by the TypeScript lint gate.
 
-SOLID, DRY, and KISS are applied pragmatically. Readability and explicitness take priority over minimizing line count.
+SOLID, DRY, and KISS are applied pragmatically. Explicitness and risk reduction take priority over
+minimizing line count.
 
-## 13. Repository and infrastructure
+## 17. Repository and quality gate
 
 The repository uses npm workspaces without Nx, Turborepo, Lerna, or a development container.
 
-The current structure is intentionally small:
+One `npm run check` command owns the source quality gate. The versioned pre-commit hook executes that
+gate in a Docker check stage against isolated PostgreSQL. CI executes the hook itself so the local
+operator gate cannot silently diverge from CI after production-image changes.
 
-```text
-threadbridge/
-├── apps/
-│   └── api/
-│       └── src/
-├── packages/
-│   └── comments/
-│       └── src/
-├── db/
-│   └── migrations/
-├── tests/
-├── Dockerfile
-├── compose.yaml
-├── package.json
-├── package-lock.json
-├── tsconfig.json
-├── eslint.config.ts
-├── .env.example
-└── SPECIFICATION.md
-```
+CI must also verify:
 
-New files and directories are added only when corresponding behavior appears.
+- exact Node/npm toolchain versions;
+- locked install with dependency lifecycle scripts disabled;
+- production npm audit at the configured severity policy;
+- Compose manifest validity;
+- strict typecheck and zero-warning lint;
+- all Vitest suites including real PostgreSQL integration and transport boundary tests;
+- production compilation;
+- compiled migration/API startup and graceful signal handling;
+- final image user/content/command properties;
+- restrictive production-container startup/readiness/logging/shutdown;
+- a clean repository after build.
 
-Local infrastructure contains two Compose services:
+Tests must verify behavior and safety boundaries rather than weaken types, lint rules, or architecture
+for convenience.
 
-- `api`;
-- `postgres`.
+## 18. Required behavior coverage
 
-The API and PostgreSQL run in separate containers. A worker container does not exist in the current scope.
+Required scenarios include:
 
-The API container applies pending database migrations before starting the HTTP server.
+- retrieving root comments and direct replies;
+- opaque cursor pagination and invalid-provider-cursor rejection;
+- provider capability routing and unsupported operation handling;
+- publishing, replaying, conflicting, retryable, terminal, and indeterminate reply outcomes;
+- partial local publication recovery;
+- database publication-operation invariants;
+- same-post parent/reply enforcement;
+- optimistic compare-and-set persistence behavior;
+- checksum/missing/edited/concurrent migration safety;
+- malformed JSON, media type, body-size, UTF-8 byte-size, identifier, header, and cursor limits;
+- caller request-ID non-trust;
+- liveness and database readiness behavior;
+- shutdown success/failure/deadline behavior;
+- OpenAPI contract consistency;
+- compiled runtime and production-container boundary smoke.
 
-The number of root npm scripts must remain minimal. A single `check` command is the quality gate used locally, by the pre-commit hook, and by CI.
+## 19. Future evolution
 
-## 14. Testing requirements
+The architecture may later gain a scheduler/background coordinator, webhook ingestion, incremental
+polling, reconciliation, durable checkpoints, a worker application, a broker, or Transactional
+Outbox when concrete product behavior requires them.
 
-Tests verify behavior and architectural boundaries rather than implementation details or a formal coverage percentage.
-
-Required test layers:
-
-- unit tests for application use cases using controlled port implementations;
-- contract tests for social-platform adapters;
-- integration tests for the PostgreSQL repository;
-- integration tests for the REST API using a real PostgreSQL instance where persistence behavior matters.
-
-Required scenarios:
-
-- retrieving root comments;
-- retrieving direct replies;
-- publishing a reply;
-- repeating an identical idempotent request;
-- rejecting different input with an already used idempotency key;
-- translating platform errors;
-- preserving cursor pagination;
-- rejecting a cursor not issued by the selected adapter;
-- rejecting an unsupported provider operation without invoking it;
-- verifying a shared adapter contract against providers with different capabilities;
-- saving external comments without duplicates;
-- optimistic-locking conflict;
-- replying to a comment at arbitrary depth;
-- health endpoint success;
-- unknown route response.
-
-The optimistic-locking scenario is owned by a PostgreSQL integration test that exercises the compare-and-set pattern directly, because no current use case accepts an expected version. Malformed identifiers and unexpected internal failures are transport concerns and are owned by the HTTP tests.
-
-Tests must not weaken TypeScript or ESLint configuration, add production behavior, or reshape the architecture solely to make tests easier.
-
-## 15. Future evolution
-
-The architecture may later be extended with:
-
-- a separate worker application;
-- a message broker;
-- Transactional Outbox;
-- webhook ingestion;
-- incremental polling;
-- reconciliation;
-- `pending`, `published`, `failed`, and `indeterminate` states;
-- manual handling of indeterminate operations;
-- comment revision history.
-
-These are extension points, not current implementation requirements.
-
-## 16. AI-assisted development disclosure
-
-AI tools assisted with architectural review, test design, implementation feedback, and
-documentation refinement.
-
-All generated output was reviewed, adapted, and validated by the project author. Architectural
-decisions, final code ownership, and responsibility for the result remain with the author.
+A future non-HTTP entry point must reuse the same application use cases or narrow ports, keep
+provider calls outside PostgreSQL transactions, and persist durable coordination state explicitly.
+Splitting execution into another process is a later deployment decision, not a reason to prebuild a
+second architecture today.

@@ -2,8 +2,18 @@ import js from '@eslint/js';
 import {defineConfig, globalIgnores} from 'eslint/config';
 import tseslint from 'typescript-eslint';
 
+const infrastructureImports = [
+    'node:*',
+    'fastify',
+    '@fastify/**',
+    'postgres',
+    'typebox',
+    '**/apps/api/**',
+];
+
 export default defineConfig(
     globalIgnores([
+        '.tmp/**',
         '**/node_modules/**',
         '**/dist/**',
         '**/coverage/**',
@@ -79,6 +89,64 @@ export default defineConfig(
             ],
             'object-shorthand': ['error', 'always'],
             'prefer-const': 'error',
+        },
+    },
+
+    {
+        files: ['packages/comments/src/{application,domain,ports}/**/*.ts'],
+        rules: {
+            'no-restricted-imports': [
+                'error',
+                {
+                    patterns: [
+                        {
+                            group: infrastructureImports,
+                            message: 'Core comment layers must not depend on infrastructure.',
+                        },
+                    ],
+                },
+            ],
+        },
+    },
+
+    {
+        files: ['packages/comments/src/domain/**/*.ts'],
+        rules: {
+            'no-restricted-imports': [
+                'error',
+                {
+                    patterns: [
+                        {
+                            group: [
+                                ...infrastructureImports,
+                                '../application/**',
+                                '../ports/**',
+                            ],
+                            message: 'Domain code may depend only on the domain layer.',
+                        },
+                    ],
+                },
+            ],
+        },
+    },
+
+    {
+        files: ['packages/comments/src/ports/**/*.ts'],
+        rules: {
+            'no-restricted-imports': [
+                'error',
+                {
+                    patterns: [
+                        {
+                            group: [
+                                ...infrastructureImports,
+                                '../application/**',
+                            ],
+                            message: 'Ports may depend on domain types, never application or infrastructure.',
+                        },
+                    ],
+                },
+            ],
         },
     },
 );

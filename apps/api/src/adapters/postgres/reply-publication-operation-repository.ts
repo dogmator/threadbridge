@@ -1,21 +1,21 @@
 import {
     toAccountId,
     toCommentId,
-    toExternalAuthorId,
-    toExternalCommentId,
     toIdempotencyKey,
-    toPostId,
+    toSocialPlatform,
     type BeginReplyPublicationInput,
     type BeginReplyPublicationResult,
     type Comment,
     type CommentId,
-    type PlatformMetadata,
+    type IdempotencyKey,
     type ReplyPublicationFailureCode,
     type ReplyPublicationOperation,
     type ReplyPublicationOperationRepository,
     type ReplyPublicationStatus,
+    type SocialPlatform,
 } from '@threadbridge/comments';
 import type {Sql, TransactionSql} from 'postgres';
+import {toComment, type CommentRow} from './comment-row.js';
 
 interface OperationRow {
     readonly id: string;
@@ -28,36 +28,19 @@ interface OperationRow {
     readonly last_failure_code: ReplyPublicationFailureCode | null;
 }
 
-interface CommentRow {
-    readonly id: string;
-    readonly post_id: string;
-    readonly parent_comment_id: string | null;
-    readonly external_comment_id: string;
-    readonly external_author_id: string;
-    readonly content: string;
-    readonly platform_created_at: Date;
-    readonly created_at: Date;
-    readonly updated_at: Date;
-    readonly version: number;
-    readonly idempotency_key: string | null;
-    readonly platform_data: PlatformMetadata | null;
+interface RecoveryOperationRow extends OperationRow {
+    readonly platform: string;
 }
 
-const toComment = (row: CommentRow): Comment => ({
-    id: toCommentId(row.id),
-    postId: toPostId(row.post_id),
-    parentCommentId: row.parent_comment_id === null ? null : toCommentId(row.parent_comment_id),
-    externalCommentId: toExternalCommentId(row.external_comment_id),
-    externalAuthorId: toExternalAuthorId(row.external_author_id),
-    content: row.content,
-    platformCreatedAt: row.platform_created_at,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
-    version: row.version,
-    metadata: row.platform_data,
-    ...(row.idempotency_key === null
-        ? {}
-        : {idempotencyKey: toIdempotencyKey(row.idempotency_key)}),
+const toOperation = (row: OperationRow, comment: Comment | null): ReplyPublicationOperation => ({
+    id: row.id,
+    accountId: toAccountId(row.account_id),
+    parentCommentId: toCommentId(row.parent_comment_id),
+    idempotencyKey: toIdempotencyKey(row.idempotency_key),
+    requestFingerprint: row.request_fingerprint,
+    status: row.status,
+    comment,
+    lastFailureCode: row.last_failure_code,
 });
 
 const readOperation = async (
@@ -91,21 +74,56 @@ const readOperation = async (
         comment = toComment(stored);
     }
 
-    return {
-        id: row.id,
-        accountId: toAccountId(row.account_id),
-        parentCommentId: toCommentId(row.parent_comment_id),
-        idempotencyKey: toIdempotencyKey(row.idempotency_key),
-        requestFingerprint: row.request_fingerprint,
-        status: row.status,
-        comment,
-        lastFailureCode: row.last_failure_code,
-    };
+    return toOperation(row, comment);
 };
 
 export class PostgresReplyPublicationOperationRepository
 implements ReplyPublicationOperationRepository {
     public constructor(private readonly sql: Sql) {}
+
+    public async findExistingByParent(
+        parentCommentId: CommentId,
+        idempotencyKey: IdempotencyKey,
+    ): Promise<{
+        readonly operation: ReplyPublicationOperation;
+        readonly platform: SocialPlatform;
+    } | null> {
+        const rows = await this.sql<RecoveryOperationRow[]>`
+            select operations.*, accounts.platform
+            from comments as requested_parent
+            join posts on posts.id = requested_parent.post_id
+            join accounts on accounts.id = posts.account_id
+            join reply_publication_operations as operations
+              on operations.account_id = accounts.id
+             and operations.idempotency_key = ${idempotencyKey}
+            where requested_parent.id = ${parentCommentId}
+        `;
+        const row = rows.at(0);
+
+        if (row === undefined) {
+            return null;
+        }
+
+        let comment: Comment | null = null;
+
+        if (row.comment_id !== null) {
+            const comments = await this.sql<CommentRow[]>`
+                select * from comments where id = ${row.comment_id}
+            `;
+            const stored = comments.at(0);
+
+            if (stored === undefined) {
+                throw new Error('A published operation references a missing comment.');
+            }
+
+            comment = toComment(stored);
+        }
+
+        return {
+            operation: toOperation(row, comment),
+            platform: toSocialPlatform(row.platform),
+        };
+    }
 
     public async begin(input: BeginReplyPublicationInput): Promise<BeginReplyPublicationResult> {
         return await this.sql.begin<BeginReplyPublicationResult>(
@@ -178,12 +196,28 @@ implements ReplyPublicationOperationRepository {
                 last_failure_code = null,
                 updated_at = now()
             where id = ${operationId}
+              and status <> 'published'
             returning *
         `;
 
-        if (rows.length !== 1) {
-            throw new Error('Publishing an operation did not update exactly one row.');
+        if (rows.length === 1) {
+            return;
         }
+
+        const current = (await this.sql<Pick<OperationRow, 'status' | 'comment_id'>[]>`
+            select status, comment_id from reply_publication_operations
+            where id = ${operationId}
+        `).at(0);
+
+        if (current?.status === 'published' && current.comment_id === commentId) {
+            return;
+        }
+
+        if (current?.status === 'published') {
+            throw new Error('A published operation cannot reference a different comment.');
+        }
+
+        throw new Error('Publishing an operation did not update exactly one row.');
     }
 
     public async markFailed(
@@ -201,11 +235,27 @@ implements ReplyPublicationOperationRepository {
                 last_failure_code = ${failureCode},
                 updated_at = now()
             where id = ${operationId}
+              and (
+                  status = 'pending'
+                  or (status = 'retryable_failed' and ${status}::text in ('failed', 'indeterminate'))
+                  or (status = 'failed' and ${status}::text = 'indeterminate')
+              )
             returning *
         `;
 
-        if (rows.length !== 1) {
-            throw new Error('Failing an operation did not update exactly one row.');
+        if (rows.length === 1) {
+            return;
         }
+
+        const current = (await this.sql<Pick<OperationRow, 'status'>[]>`
+            select status from reply_publication_operations
+            where id = ${operationId}
+        `).at(0);
+
+        if (current !== undefined) {
+            return;
+        }
+
+        throw new Error('Failing an operation did not update exactly one row.');
     }
 }

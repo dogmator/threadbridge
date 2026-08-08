@@ -17,11 +17,13 @@ import {PostgresCommentRepository} from './adapters/postgres/comment-repository.
 import {PostgresPublishedPostRepository} from './adapters/postgres/published-post-repository.js';
 import {PostgresReplyPublicationOperationRepository}
     from './adapters/postgres/reply-publication-operation-repository.js';
+import {DATABASE_CONNECT_TIMEOUT_SECONDS} from './config.js';
 import type {ApiServerDependencies} from './server.js';
 import {SHUTDOWN_GRACE_PERIOD_MS} from './shutdown.js';
 
 const DEMO_PLATFORM = toSocialPlatform('demo');
 const LIMITED_DEMO_PLATFORM = toSocialPlatform('demo-limited');
+const DATABASE_APPLICATION_NAME = 'threadbridge-api';
 
 export interface ApiComponents {
     readonly dependencies: ApiServerDependencies;
@@ -34,7 +36,10 @@ export interface ApiComponents {
  * entry to the registry below.
  */
 export const createApiComponents = (databaseUrl: string): ApiComponents => {
-    const sql = postgres(databaseUrl);
+    const sql = postgres(databaseUrl, {
+        connect_timeout: DATABASE_CONNECT_TIMEOUT_SECONDS,
+        connection: {application_name: DATABASE_APPLICATION_NAME},
+    });
     const publishedPosts = new PostgresPublishedPostRepository(sql);
     const replyContexts = new PostgresCommentReplyContextRepository(sql);
     const comments = new PostgresCommentRepository(sql);
@@ -47,6 +52,9 @@ export const createApiComponents = (databaseUrl: string): ApiComponents => {
     return {
         dependencies: {
             requestIdFactory: randomUUID,
+            checkReadiness: async (): Promise<void> => {
+                await sql`select 1`;
+            },
             getPostComments: new GetPostComments(publishedPosts, gateways, comments),
             getCommentReplies: new GetCommentReplies(replyContexts, gateways, comments),
             // This adapter owns both active reply-context reads and explicit

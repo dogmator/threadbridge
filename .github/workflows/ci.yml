@@ -9,11 +9,11 @@ permissions:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     services:
       postgres:
-        image: postgres:18-alpine
+        image: postgres:18.4-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
         env:
           POSTGRES_DB: threadbridge
           POSTGRES_USER: threadbridge
@@ -31,16 +31,114 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Set up Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version-file: .nvmrc
           cache: npm
 
+      - name: Verify runtime toolchain
+        run: |
+          test "$(node --version)" = "v24.18.1"
+          test "$(npm --version)" = "11.16.0"
+
+      - name: Validate deployment configuration
+        run: docker compose config --quiet
+
       - name: Install dependencies
-        run: npm ci
+        run: npm ci --ignore-scripts
+
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=moderate
 
       - name: Run checks
         run: npm run check
+
+      - name: Verify local pre-commit gate
+        run: .githooks/pre-commit
+
+      - name: Build production artifacts
+        run: npm run build
+
+      - name: Smoke compiled runtime
+        run: |
+          node --conditions=production apps/api/dist/migrate.js
+          API_PORT=3100 node --conditions=production apps/api/dist/index.js &
+          api_pid=$!
+          trap 'kill -TERM "$api_pid" 2>/dev/null || true' EXIT
+
+          ready=0
+          for attempt in $(seq 1 20); do
+            if node -e "fetch('http://127.0.0.1:3100/ready').then((response) => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))"; then
+              ready=1
+              break
+            fi
+            sleep 0.25
+          done
+
+          test "$ready" -eq 1
+          kill -TERM "$api_pid"
+          wait "$api_pid"
+          trap - EXIT
+
+      - name: Build production image
+        run: docker build --tag threadbridge:ci .
+
+      - name: Verify production image contents
+        run: |
+          test "$(docker image inspect --format '{{.Config.User}}' threadbridge:ci)" = "node"
+          test "$(docker image inspect --format '{{.Config.StopSignal}}' threadbridge:ci)" = "SIGTERM"
+          test "$(docker image inspect --format '{{json .Config.Cmd}}' threadbridge:ci)" = '["node","--enable-source-maps","--conditions=production","apps/api/dist/index.js"]'
+          docker run --rm --entrypoint sh threadbridge:ci -c '
+            test ! -e node_modules/tsx
+            test ! -e apps/api/src
+            test ! -e packages/comments/src
+            test -f apps/api/dist/index.js
+            test -f apps/api/dist/migrate.js
+            test -f packages/comments/dist/index.js
+          '
+
+      - name: Smoke production image
+        run: |
+          container_database_url='postgresql://threadbridge:threadbridge@host.docker.internal:5432/threadbridge'
+          docker run --detach \
+            --name threadbridge-runtime \
+            --add-host host.docker.internal:host-gateway \
+            --publish 3101:3101 \
+            --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+            --cap-drop ALL \
+            --security-opt no-new-privileges=true \
+            --env DATABASE_URL="$container_database_url" \
+            --env API_PORT=3101 \
+            threadbridge:ci
+          trap 'docker rm --force threadbridge-runtime >/dev/null 2>&1 || true' EXIT
+
+          ready=0
+          for attempt in $(seq 1 40); do
+            if node -e "fetch('http://127.0.0.1:3101/ready').then((response) => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))"; then
+              ready=1
+              break
+            fi
+            sleep 0.25
+          done
+
+          test "$ready" -eq 1
+
+          log_secret='threadbridge-ci-query-secret'
+          node -e "fetch('http://127.0.0.1:3101/unknown?marker=${log_secret}').then((response) => process.exit(response.status === 404 ? 0 : 1)).catch(() => process.exit(1))"
+          sleep 0.1
+          runtime_logs="$(docker logs threadbridge-runtime 2>&1)"
+          printf '%s\n' "$runtime_logs" | grep -Fq '"statusCode":404'
+          printf '%s\n' "$runtime_logs" | grep -Fq '"route":"<unmatched>"'
+          ! printf '%s\n' "$runtime_logs" | grep -Fq "$log_secret"
+
+          docker stop --timeout 15 threadbridge-runtime
+          test "$(docker inspect --format '{{.State.ExitCode}}' threadbridge-runtime)" = "0"
+          docker rm threadbridge-runtime
+          trap - EXIT
+
+      - name: Verify build leaves repository clean
+        run: test -z "$(git status --porcelain --untracked-files=all)"

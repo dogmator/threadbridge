@@ -26,6 +26,7 @@
   },
   "include": [
     "eslint.config.ts",
+    "vitest.config.ts",
     "apps/**/*.ts",
     "packages/**/*.ts",
     "tests/**/*.ts"

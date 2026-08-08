@@ -9,12 +9,15 @@ import {PostgresCommentRepository}
     from '../apps/api/src/adapters/postgres/comment-repository.js';
 import {PostgresPublishedPostRepository}
     from '../apps/api/src/adapters/postgres/published-post-repository.js';
+import {PostgresReplyPublicationOperationRepository}
+    from '../apps/api/src/adapters/postgres/reply-publication-operation-repository.js';
 import {createApiComponents, type ApiComponents} from '../apps/api/src/composition.js';
 import {runMigrations} from '../apps/api/src/migrations.js';
 import {createApiServer} from '../apps/api/src/server.js';
 import type {CommentPageResponse, CommentResponse} from '../apps/api/src/comment-response.js';
 import type {HttpErrorEnvelope} from '../apps/api/src/http-error.js';
 import {
+    err,
     ok,
     ReplyToComment,
     toAccountId,
@@ -27,6 +30,7 @@ import {
     type AccountId,
     type Comment,
     type CommentId,
+    type CommentProjectionStateRepository,
     type ExternalCommentId,
     type IdempotencyKey,
     type IndeterminatePlatformResultFailure,
@@ -118,6 +122,11 @@ afterAll(async (): Promise<void> => {
         delete from reply_publication_operations
         where account_id in (
             select id from accounts where external_account_id = ${fixtureExternalAccountId}
+        ) or parent_comment_id in (
+            select comments.id from comments
+            join posts on posts.id = comments.post_id
+            join accounts on accounts.id = posts.account_id
+            where accounts.external_account_id = ${fixtureExternalAccountId}
         )
     `;
     await sql`
@@ -150,6 +159,7 @@ describe('migrations', () => {
             '0003_comment_parent_post_consistency.sql',
             '0004_provider_boundary_hardening.sql',
             '0005_limited_demo_seed.sql',
+            '0006_publication_failure_code_invariant.sql',
         ]);
         expect(rows.every((row): boolean => row.checksum.length === 64)).toBe(true);
     });
@@ -791,6 +801,165 @@ class ConvergingGateway implements SocialCommentsGateway {
 }
 
 describe('ReplyToComment against real PostgreSQL', () => {
+    it('replays a terminal operation after its parent projection is deleted', async () => {
+        const comments = new PostgresCommentRepository(sql);
+        const contexts = new PostgresCommentReplyContextRepository(sql);
+        const operations = new PostgresReplyPublicationOperationRepository(sql);
+        const [parent] = await comments.saveMany([importedComment('deleted-terminal-replay', null)]);
+
+        if (parent === undefined) {
+            throw new Error('The parent comment was not persisted.');
+        }
+
+        let providerCalls = 0;
+        const gateway: SocialCommentsGateway = {
+            capabilities: {
+                rootComments: false,
+                directReplies: false,
+                replyPublication: true,
+                publicationIdempotency: 'none',
+            },
+            getComments: (): never => {
+                throw new Error('This gateway only publishes.');
+            },
+            getReplies: (): never => {
+                throw new Error('This gateway only publishes.');
+            },
+            replyToComment: (): Promise<Result<PlatformComment, PlatformFailure>> => {
+                providerCalls += 1;
+                return Promise.resolve(
+                    err<PlatformFailure>({code: 'PLATFORM_RESOURCE_NOT_FOUND'}),
+                );
+            },
+        };
+        const useCase = new ReplyToComment(
+            contexts,
+            new Map([[toSocialPlatform('demo'), gateway]]),
+            comments,
+            operations,
+            contexts,
+        );
+        const key = toIdempotencyKey('integration-key-deleted-terminal-replay');
+        const request = {parentCommentId: parent.id, content: 'Reply', idempotencyKey: key};
+        const unrelatedAccount = (await sql<IdRow[]>`
+            select id from accounts where external_account_id = 'demo-limited-account-1'
+        `).at(0);
+
+        if (unrelatedAccount === undefined) {
+            throw new Error('The unrelated account fixture was not found.');
+        }
+
+        // This row is schema-valid but deliberately points another account at the same parent and
+        // key. Recovery must derive the parent's owning account before applying the durable key.
+        await sql`
+            insert into reply_publication_operations (
+                account_id, parent_comment_id, idempotency_key, request_fingerprint,
+                status, last_failure_code
+            ) values (
+                ${unrelatedAccount.id}, ${parent.id}, ${key},
+                ${JSON.stringify([parent.id, request.content])},
+                'failed', 'PLATFORM_PERMISSION_DENIED'
+            )
+        `;
+
+        const first = await useCase.execute(request);
+        const replay = await useCase.execute(request);
+        const conflictingReplay = await useCase.execute({...request, content: 'Different reply'});
+        const newRequest = await useCase.execute({
+            ...request,
+            idempotencyKey: toIdempotencyKey('integration-key-deleted-parent-new-request'),
+        });
+        const projection = (await sql<{readonly projection_state: string}[]>`
+            select projection_state from comments where id = ${parent.id}
+        `).at(0);
+        const matchingOperations = await sql<IdRow[]>`
+            select id from reply_publication_operations
+            where parent_comment_id = ${parent.id} and idempotency_key = ${key}
+        `;
+
+        expect(first).toEqual({ok: false, error: {code: 'PLATFORM_RESOURCE_NOT_FOUND'}});
+        expect(replay).toEqual({ok: false, error: {code: 'PLATFORM_RESOURCE_NOT_FOUND'}});
+        expect(conflictingReplay).toEqual({
+            ok: false,
+            error: {code: 'IDEMPOTENCY_CONFLICT', idempotencyKey: key},
+        });
+        expect(newRequest).toEqual({
+            ok: false,
+            error: {code: 'COMMENT_NOT_FOUND', commentId: parent.id},
+        });
+        expect(projection?.projection_state).toBe('deleted');
+        expect(matchingOperations).toHaveLength(2);
+        expect(providerCalls).toBe(1);
+    });
+
+    it('preserves a confirmed provider not-found when projection persistence fails', async () => {
+        const comments = new PostgresCommentRepository(sql);
+        const contexts = new PostgresCommentReplyContextRepository(sql);
+        const operations = new PostgresReplyPublicationOperationRepository(sql);
+        const [parent] = await comments.saveMany([importedComment('projection-failure', null)]);
+
+        if (parent === undefined) {
+            throw new Error('The parent comment was not persisted.');
+        }
+
+        let providerCalls = 0;
+        let projectionCalls = 0;
+        const gateway: SocialCommentsGateway = {
+            capabilities: {
+                rootComments: false,
+                directReplies: false,
+                replyPublication: true,
+                publicationIdempotency: 'none',
+            },
+            getComments: (): never => {
+                throw new Error('This gateway only publishes.');
+            },
+            getReplies: (): never => {
+                throw new Error('This gateway only publishes.');
+            },
+            replyToComment: (): Promise<Result<PlatformComment, PlatformFailure>> => {
+                providerCalls += 1;
+                return Promise.resolve(
+                    err<PlatformFailure>({code: 'PLATFORM_RESOURCE_NOT_FOUND'}),
+                );
+            },
+        };
+        const projectionStates: CommentProjectionStateRepository = {
+            markDeleted: (): Promise<void> => {
+                projectionCalls += 1;
+                return Promise.reject(new Error('Projection persistence failed.'));
+            },
+        };
+        const useCase = new ReplyToComment(
+            contexts,
+            new Map([[toSocialPlatform('demo'), gateway]]),
+            comments,
+            operations,
+            projectionStates,
+        );
+        const key = toIdempotencyKey('integration-key-projection-failure');
+        const request = {parentCommentId: parent.id, content: 'Reply', idempotencyKey: key};
+
+        await expect(useCase.execute(request)).rejects.toThrow('Projection persistence failed.');
+
+        const afterInterruption = (await sql<{
+            readonly status: string;
+            readonly last_failure_code: string | null;
+        }[]>`
+            select status, last_failure_code from reply_publication_operations
+            where account_id = ${fixtureAccountId} and idempotency_key = ${key}
+        `).at(0);
+        const replay = await useCase.execute(request);
+
+        expect(afterInterruption).toEqual({
+            status: 'failed',
+            last_failure_code: 'PLATFORM_RESOURCE_NOT_FOUND',
+        });
+        expect(replay).toEqual({ok: false, error: {code: 'PLATFORM_RESOURCE_NOT_FOUND'}});
+        expect(providerCalls).toBe(1);
+        expect(projectionCalls).toBe(1);
+    });
+
     it('resolves a same-key race as one row plus an idempotency conflict', async () => {
         const comments = new PostgresCommentRepository(sql);
         const contexts = new PostgresCommentReplyContextRepository(sql);
@@ -1054,10 +1223,85 @@ class ProviderIdempotentGateway implements SocialCommentsGateway {
     }
 }
 
+class OrderedOutcomeGateway implements SocialCommentsGateway {
+    public readonly capabilities: SocialCommentsCapabilities = {
+        rootComments: false,
+        directReplies: false,
+        replyPublication: true,
+        publicationIdempotency: 'native',
+    };
+
+    private calls = 0;
+
+    private signalEntered: (() => void) | null = null;
+
+    private readonly bothEntered = new Promise<void>((resolve): void => {
+        this.signalEntered = resolve;
+    });
+
+    private readonly releases: readonly (() => void)[];
+
+    private readonly released: readonly Promise<void>[];
+
+    public constructor() {
+        const resolvers: (() => void)[] = [];
+        this.released = [0, 1].map((): Promise<void> => new Promise<void>((resolve): void => {
+            resolvers.push(resolve);
+        }));
+        this.releases = resolvers;
+    }
+
+    public get callCount(): number {
+        return this.calls;
+    }
+
+    public async waitForBothCalls(): Promise<void> {
+        await this.bothEntered;
+    }
+
+    public release(call: number): void {
+        this.releases[call]?.();
+    }
+
+    public getComments(): never {
+        throw new Error('This gateway only publishes.');
+    }
+
+    public getReplies(): never {
+        throw new Error('This gateway only publishes.');
+    }
+
+    public async replyToComment(
+        input: ReplyToPlatformCommentInput,
+    ): Promise<Result<PlatformComment, PlatformFailure | IndeterminatePlatformResultFailure>> {
+        const call = this.calls;
+        this.calls += 1;
+
+        if (this.calls === 2) {
+            this.signalEntered?.();
+        }
+
+        await this.released[call];
+
+        if (call === 1) {
+            return {ok: false, error: {code: 'PLATFORM_TIMEOUT'}};
+        }
+
+        return ok<PlatformComment>({
+            externalCommentId: toExternalCommentId(`integration-ordered-outcome-${input.idempotencyKey}`),
+            externalAuthorId: toExternalAuthorId('integration-author-self'),
+            content: input.content,
+            createdAt: platformCreatedAt,
+            metadata: null,
+        });
+    }
+}
+
 describe('external publication under concurrency', () => {
     it('creates one external publication for two concurrent requests with one key', async () => {
         const comments = new PostgresCommentRepository(sql);
         const contexts = new PostgresCommentReplyContextRepository(sql);
+        const operations = new PostgresReplyPublicationOperationRepository(sql);
         const [parent] = await comments.saveMany([importedComment('provider-idempotent', null)]);
 
         if (parent === undefined) {
@@ -1069,6 +1313,7 @@ describe('external publication under concurrency', () => {
             contexts,
             new Map<SocialPlatform, SocialCommentsGateway>([[toSocialPlatform('demo'), gateway]]),
             comments,
+            operations,
         );
         const key = toIdempotencyKey('integration-key-provider');
         const request = {
@@ -1079,6 +1324,7 @@ describe('external publication under concurrency', () => {
 
         // Neither call rejects: a database exception would surface here as a rejected promise.
         const results = await Promise.all([useCase.execute(request), useCase.execute(request)]);
+        const replay = await useCase.execute(request);
         const rows = await sql<IdRow[]>`
             select id from comments where idempotency_key = ${key}
         `;
@@ -1087,9 +1333,66 @@ describe('external publication under concurrency', () => {
 
         expect(gateway.externalPublications).toBe(1);
         expect(results.every((result): boolean => result.ok)).toBe(true);
+        expect(replay).toMatchObject({ok: true, value: {kind: 'existing'}});
         expect(new Set(identifiers).size).toBe(1);
         expect(rows).toHaveLength(1);
         expect(identifiers.at(0)).toBe(rows.at(0)?.id);
+        expect(gateway.externalPublications).toBe(1);
+    });
+
+    it('retains success and replays it when a concurrent retryable failure finishes later', async () => {
+        const comments = new PostgresCommentRepository(sql);
+        const contexts = new PostgresCommentReplyContextRepository(sql);
+        const operations = new PostgresReplyPublicationOperationRepository(sql);
+        const [parent] = await comments.saveMany([importedComment('ordered-outcome', null)]);
+
+        if (parent === undefined) {
+            throw new Error('The parent comment was not persisted.');
+        }
+
+        const gateway = new OrderedOutcomeGateway();
+        const useCase = new ReplyToComment(
+            contexts,
+            new Map<SocialPlatform, SocialCommentsGateway>([[toSocialPlatform('demo'), gateway]]),
+            comments,
+            operations,
+        );
+        const key = toIdempotencyKey('integration-key-ordered-outcome');
+        const request = {parentCommentId: parent.id, content: 'Ordered outcome', idempotencyKey: key};
+        const executions = [useCase.execute(request), useCase.execute(request)] as const;
+
+        await gateway.waitForBothCalls();
+        gateway.release(0);
+
+        let published = false;
+
+        for (let attempt = 0; attempt < 100; attempt += 1) {
+            const row = (await sql<{readonly status: string}[]>`
+                select status from reply_publication_operations
+                where account_id = ${fixtureAccountId} and idempotency_key = ${key}
+            `).at(0);
+
+            if (row?.status === 'published') {
+                published = true;
+                break;
+            }
+
+            await setTimeout(10);
+        }
+
+        expect(published).toBe(true);
+        gateway.release(1);
+        await Promise.all(executions);
+        const replay = await useCase.execute(request);
+        const operation = (await sql<{readonly status: string; readonly comment_id: string | null}[]>`
+            select status, comment_id from reply_publication_operations
+            where account_id = ${fixtureAccountId} and idempotency_key = ${key}
+        `).at(0);
+
+        expect(operation?.status).toBe('published');
+        expect(operation?.comment_id).not.toBeNull();
+        expect(replay).toMatchObject({ok: true, value: {kind: 'existing'}});
+        expect(gateway.callCount).toBe(2);
     });
 });
 
@@ -1192,8 +1495,7 @@ describe('retrieval REST endpoints', () => {
     beforeAll(async (): Promise<void> => {
         components = createApiComponents(databaseUrl);
         server = createApiServer(components.dependencies);
-        server.listen(0, '127.0.0.1');
-        await once(server, 'listening');
+        await server.listen(0, '127.0.0.1');
 
         const address = server.address();
 

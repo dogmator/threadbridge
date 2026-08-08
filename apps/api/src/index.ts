@@ -1,17 +1,16 @@
 import {createApiComponents} from './composition.js';
+import {loadApiConfig} from './config.js';
+import {migrateDatabase} from './database-migrations.js';
 import {createApiServer} from './server.js';
 import {createGracefulShutdown, SHUTDOWN_GRACE_PERIOD_MS} from './shutdown.js';
 
-const databaseUrl = process.env.DATABASE_URL;
+const config = loadApiConfig(process.env);
+await migrateDatabase(config.databaseUrl);
 
-if (databaseUrl === undefined) {
-    throw new Error('DATABASE_URL is required');
-}
+const components = createApiComponents(config.databaseUrl);
+const server = createApiServer(components.dependencies, {logger: true});
 
-const components = createApiComponents(databaseUrl);
-const server = createApiServer(components.dependencies);
-
-server.listen(Number.parseInt(process.env.API_PORT ?? '3000', 10));
+await server.listen(config.port);
 
 const shutdown = createGracefulShutdown({
     server,
